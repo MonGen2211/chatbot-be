@@ -9,7 +9,7 @@ export class HttpError extends Error {
 export const notFound: RequestHandler = (_req, res) => {
   res.status(404).json({ success: false, message: 'Route không tồn tại.' });
 };
-
+// ghi chú mới:
 export const errorHandler: ErrorRequestHandler = (error: unknown, _req, res, _next) => {
   if (error instanceof HttpError) {
     res.status(error.status).json({ success: false, message: error.message, ...(error.code ? { code: error.code } : {}) });
