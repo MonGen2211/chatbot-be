@@ -1,5 +1,5 @@
 import { HttpError } from '../middlewares/error.middleware';
-import type { LoginInput } from '../types/auth.types';
+import type { LoginInput, RegisterInput } from '../types/auth.types';
 
 export function validateLogin(body: unknown): LoginInput {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -13,4 +13,12 @@ export function validateLogin(body: unknown): LoginInput {
     throw new HttpError(400, 'Password phải là chuỗi từ 1 đến 4096 ký tự.');
   }
   return { email: email.trim(), password };
+}
+
+export function validateRegister(body: unknown): RegisterInput {
+  const input = validateLogin(body);
+  if (input.password.length < 8) {
+    throw new HttpError(400, 'Mật khẩu đăng ký phải có ít nhất 8 ký tự.', 'weak_password');
+  }
+  return input;
 }

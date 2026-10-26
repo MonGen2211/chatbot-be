@@ -38,4 +38,7 @@ export const env = {
   corsOrigin: process.env.CORS_ORIGIN?.trim() || 'http://localhost:5173',
   supabaseUrl: parsedSupabaseUrl.toString().replace(/\/$/, ''),
   supabaseKey,
+  supabaseServerKey: process.env.SUPABASE_SECRET_KEY?.trim() || '',
+  geminiApiKey: process.env.GEMINI_API_KEY?.trim() || '',
+  geminiModel: process.env.GEMINI_MODEL?.trim() || 'gemini-3.1-flash-lite',
 };
