@@ -1,6 +1,8 @@
 # AI Chat Backend
 
-Backend Express + TypeScript. Hiện chỉ có **POST /api/auth/login**, dùng email/password qua Supabase Auth.
+Backend Express + TypeScript, có **POST /api/auth/login**, **POST /api/auth/register** và **POST /api/conversations/send-messages** (Gemini streaming).
+
+Lịch sử chat: **GET /api/conversations** lấy danh sách của user đăng nhập; **GET /api/conversations/:conversation_id/messages** lấy tin nhắn của conversation thuộc user đó. Cả hai yêu cầu Bearer token và hỗ trợ `limit`, `offset`.
 
 ## Chạy local
 
@@ -18,13 +20,13 @@ Mặc định API chạy tại `http://localhost:3001`. Frontend được phép 
 ## Chỗ kết nối Supabase
 
 - **`.env`**: điền `SUPABASE_URL` và `SUPABASE_PUBLISHABLE_KEY` theo `.env.example`.
-- Lấy Project URL và publishable key từ Connect dialog hoặc phần API Keys trong Supabase Dashboard. Legacy `anon` key cũng dùng được. Backend hỗ trợ `SUPABASE_SECRET_KEY` nếu dùng secret key; chỉ giữ key này phía server, không đưa vào frontend. Publishable key được ưu tiên nếu cấu hình cả hai.
+- Lấy Project URL và publishable key từ Connect dialog hoặc phần API Keys trong Supabase Dashboard. Legacy `anon` key cũng dùng được. Backend hỗ trợ `SUPABASE_SECRET_KEY`; chỉ giữ key này phía server, không đưa vào frontend. Auth ưu tiên publishable key nếu cấu hình cả hai; client truy vấn chat ưu tiên secret key backend.
 - **`src/config/env.ts`**: đọc và kiểm tra biến môi trường.
 - **`src/config/supabase.ts`**: khởi tạo Supabase client. Đây là chỗ cấu hình kết nối.
 - SDK dùng HTTPS API của Supabase, không cần `DATABASE_URL`, password Postgres hay driver SQL cho route này.
 - Mỗi lần đăng nhập tạo client riêng để phiên của các user không dùng chung.
 
-SQL/schema hiện có trên Supabase được giữ nguyên. Route này xác thực tài khoản trong **Supabase Authentication**, không đọc mật khẩu từ bảng `public.users` hoặc `profiles` tự tạo. Chưa có truy vấn bảng SQL nào vì chưa có schema local để đối chiếu. Khi thêm truy vấn sau này, cần gắn access token của người gọi và cấu hình RLS tương ứng.
+SQL/schema hiện có trên Supabase được giữ nguyên. Các route auth xác thực tài khoản trong **Supabase Authentication**, không đọc mật khẩu từ bảng `public.users` hoặc `profiles` tự tạo. Route chat dùng `conversations` và `messages` hiện có, xác minh token rồi gắn/kiểm tra user ID của chủ sở hữu trước khi truy cập dữ liệu bằng kết nối backend. Chi tiết trong hướng dẫn API chat bên dưới.
 
 ## Tạo tài khoản và test API
 
@@ -63,14 +65,44 @@ Thành công trả `200`, `success: true`, `data.user` và `data.session` gồm 
 
 Lỗi đăng nhập có trường `code` để phân biệt nguyên nhân. Trong development, terminal chỉ ghi status/code/name của lỗi Supabase, không ghi email, mật khẩu hay token.
 
+## Đăng ký tài khoản
+
+Postman: **POST** `http://localhost:3001/api/auth/register`, Body → raw → JSON:
+
+```json
+{
+  "email": "new-user@example.com",
+  "password": "YourStrongPassword123!"
+}
+```
+
+Mật khẩu tối thiểu 8 ký tự, giữ nguyên khoảng trắng nếu có. Supabase có thể yêu cầu chính sách mật khẩu mạnh hơn theo cấu hình project. Route tạo tài khoản Supabase Auth, không tự ghi vào bảng profile riêng; trigger SQL hiện có trên Supabase vẫn chạy bình thường.
+
+- **201**: đăng ký có session (khi project không yêu cầu xác nhận email). `data.user` và `data.session` có dữ liệu, `email_confirmation_required: false`.
+- **202**: yêu cầu được tiếp nhận, cần kiểm tra email. `data.user` và `data.session` là `null`, `email_confirmation_required: true`. Không khẳng định tài khoản mới đã được tạo, vì Supabase có thể che giấu email đã tồn tại. Xác nhận email rồi gọi route login.
+- **400**: đầu vào không hợp lệ, mật khẩu yếu hoặc email không được phép nhận thư.
+- **403**: Supabase tắt đăng ký/email provider.
+- **409**: Supabase trả rõ lỗi email đã tồn tại. Khi bật xác nhận email, có thể trả 202 thay vì 409.
+- **429**: vượt giới hạn đăng ký/gửi email.
+- **502/503**: lỗi Supabase/cấu hình/dịch vụ không khả dụng.
+
+Trong Supabase Authentication, bật cho phép đăng ký user mới và email/password provider. Cấu hình Site URL cho link xác nhận; route dùng luồng email mặc định của Supabase, không tự xác nhận email hoặc gọi API admin. Nếu bật CAPTCHA, cần bổ sung luồng CAPTCHA trước khi dùng route này. Không cần đổi key đang dùng trong `.env`.
+
+Tài liệu: [Supabase signUp](https://supabase.com/docs/reference/javascript/auth-signup).
+
+## Gửi tin nhắn và stream Gemini
+
+Xem [hướng dẫn API chat](docs/send-messages.md) để cấu hình Gemini, gọi từ Postman/cURL/FE và đọc stream SSE. Route dùng bảng `conversations` và `messages` hiện có; không cần tạo bảng mới.
+
 ## Lệnh khác
 
 ```powershell
 npm run typecheck
+npm test
 npm run build
 npm start
 ```
 
-`npm start` chạy bản đã build trong `dist/`. Chưa triển khai đăng ký, đăng xuất, refresh token hoặc các route chat.
+`npm start` chạy bản đã build trong `dist/`. Chưa triển khai đăng xuất, refresh token hoặc xóa lịch sử chat.
 
 Tài liệu: [Supabase password login](https://supabase.com/docs/reference/javascript/auth-signinwithpassword), [API keys](https://supabase.com/docs/guides/getting-started/api-keys).
