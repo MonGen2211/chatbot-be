@@ -20,5 +20,6 @@ export function validateRegister(body: unknown): RegisterInput {
   if (input.password.length < 8) {
     throw new HttpError(400, 'Mật khẩu đăng ký phải có ít nhất 8 ký tự.', 'weak_password');
   }
+  if (Buffer.byteLength(input.password, 'utf8') > 72) throw new HttpError(400, 'Mật khẩu đăng ký tối đa 72 byte UTF-8.', 'invalid_password');
   return input;
 }

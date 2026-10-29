@@ -1,5 +1,6 @@
 import { app } from './app';
 import { env } from './config/env';
+import { pool } from './config/database';
 
 const server = app.listen(env.port, () => {
   console.log(`API running at http://localhost:${env.port}`);
@@ -11,7 +12,7 @@ server.on('error', (error) => {
 });
 
 function shutdown() {
-  server.close(() => process.exit(0));
+  server.close(() => { void pool.end().finally(() => process.exit(0)); });
   setTimeout(() => process.exit(1), 10_000).unref();
 }
 process.once('SIGINT', shutdown);

@@ -1,4 +1,5 @@
 import { env } from '../config/env';
+import { CHAT_DEVELOPER_PROMPT } from '../config/chat-prompt';
 import { HttpError } from '../middlewares/error.middleware';
 import type { ChatMessage } from '../types/chat.types';
 
@@ -22,7 +23,11 @@ export async function* streamGemini(history: ChatMessage[], message: string, sig
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${env.geminiModel}:streamGenerateContent?alt=sse`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.geminiApiKey },
-    body: JSON.stringify({ contents, generationConfig: { maxOutputTokens: 8192 } }),
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: CHAT_DEVELOPER_PROMPT }] },
+      contents,
+      generationConfig: { maxOutputTokens: 8192 },
+    }),
     signal,
   });
   if (!response.ok || !response.body) {
