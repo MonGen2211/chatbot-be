@@ -1,52 +1,85 @@
-# Send messages với Gemini streaming
+# Chat API: PostgreSQL + local JWT + Gemini streaming
 
-## Cấu hình
+Base URL: `http://localhost:3001`. Cấu hình `DATABASE_URL`, chạy `npm.cmd run db:migrate` trước khi test. Xem [README](../README.md) về chuyển user cũ từ Supabase Auth và kết nối database.
 
-Trong `ai-chat-be/.env`, điền key lấy từ Google AI Studio:
+## Đăng nhập
 
-```env
-GEMINI_API_KEY=your-google-ai-studio-key
-GEMINI_MODEL=gemini-3.1-flash-lite
+`POST /api/auth/login`, Body → raw → JSON:
+
+```json
+{ "email": "test@example.com", "password": "YourPassword123!" }
 ```
 
-Model có thể đổi theo quyền truy cập của project Google. Key chỉ nằm ở backend. Route không sử dụng key `VITE_GEMINI_API_KEY` của FE. Dừng và chạy lại `npm.cmd run dev` sau khi sửa `.env`.
+Copy `data.session.access_token`. Token hiện do backend ký, không dùng access token Supabase cũ. Nếu chưa có user, gọi `POST /api/auth/register` với cùng dạng body để tạo user/profile; mật khẩu tối thiểu 8 ký tự và tối đa 72 byte UTF-8. Đăng ký mới trả 201 với session, không có bước email confirmation. Session không có refresh token; token hết hạn thì đăng nhập lại.
 
-Backend gọi REST `streamGenerateContent?alt=sse` theo [Gemini API](https://ai.google.dev/api/generate-content); không cần cài thêm SDK. Route auth vẫn chạy khi chưa điền Gemini key; route chat trả 503 nếu thiếu key.
-
-## Request
+## Header cho các API chat
 
 ```http
-POST /api/conversations/send-messages
-Authorization: Bearer <access_token từ API login>
+Authorization: Bearer <access_token>
 Content-Type: application/json
 ```
 
-Chat mới, không gửi ID hoặc gửi `null`:
+User ID lấy từ JWT đã xác minh; FE không gửi `user_id`. Conversation không thuộc user hoặc không tồn tại trả 404; token sai/hết hạn trả 401.
+
+## Gửi message
+
+`POST /api/conversations/send-messages`
+
+Chat mới:
 
 ```json
-{
-  "message": "Xin chào, giới thiệu bản thân nhé!"
-}
+{ "message": "Giải thích middleware trong Node.js ngắn gọn nhé" }
 ```
 
-Backend tạo conversation với `user_id` lấy từ token, lưu tin nhắn user và trả ID trong event đầu tiên. FE phải giữ ID này và gửi lại ở lượt tiếp theo:
+Chat tiếp:
 
 ```json
-{
-  "conversation_id": "UUID nhận từ event conversation",
-  "message": "Bạn có thể giúp mình học TypeScript không?"
-}
+{ "conversation_id": "UUID-tu-event-conversation", "message": "Cho mình ví dụ thực tế" }
 ```
 
-`conservation_id` được chấp nhận như alias cho `conversation_id`. Nếu ID được gửi nhưng không tồn tại/không thuộc user, trả **404**, không tự tạo conversation khác. Không gửi ID mock như `conversation-1`; ID thật là UUID từ backend. Không gửi `user_id`, role hay lịch sử từ FE: backend tự xác minh chủ sở hữu và đọc lịch sử từ database.
+Không có conversation ID hoặc gửi null thì tạo conversation thuộc user. ID có rồi thì kiểm tra chủ sở hữu và dùng lại. `conservation_id` vẫn được chấp nhận như alias. Message tối đa 12000 ký tự, không chỉ khoảng trắng; body tối đa 64 KiB.
 
-Message từ 1 đến 12000 ký tự, không chỉ khoảng trắng. Body giới hạn 64 KiB. Route dùng 40 tin nhắn hoàn tất gần nhất, tối đa 48000 ký tự lịch sử, và thêm tin nhắn hiện tại làm context cho Gemini.
+Backend đọc tối đa 40 messages hoàn tất gần nhất/48000 ký tự, ghép message mới và gửi Gemini `streamGenerateContent?alt=sse`. Cấu hình `GEMINI_API_KEY` và `GEMINI_MODEL` trong `.env` backend. Mỗi lượt đều gửi prompt ở `src/config/chat-prompt.ts` qua `systemInstruction`. Prompt hiện giới hạn Next.js/Node.js, tiếng Việt/plain text và câu cảnh báo cuối; đây là hướng dẫn model, không bảo đảm tuân thủ tuyệt đối.
 
-## Lấy danh sách conversation và messages
+## Response SSE
 
-Cả hai API GET trả JSON và yêu cầu `Authorization: Bearer <access_token>` giống send-messages. Không cần Gemini key để gọi hai API này.
+```text
+event: conversation
+data: {"conversation_id":"uuid","created":true,"user_message_id":"uuid"}
 
-**GET `/api/conversations?limit=50&offset=0`** lấy conversation theo `user_id` của người đăng nhập, mới cập nhật nhất trước. FE không cần truyền `user_id`; backend lấy ID đã xác minh từ token và không dùng user ID trong query/body để quyết định chủ sở hữu.
+event: delta
+data: {"text":"Middleware là "}
+
+event: delta
+data: {"text":"hàm xử lý trong luồng request..."}
+
+event: done
+data: {"conversation_id":"uuid","message":{"id":"uuid","conversation_id":"uuid","role":"assistant","content":"...","created_at":"..."}}
+
+```
+
+- `conversation`: lưu ID để dùng lại. User message đã được lưu.
+- `delta`: nối `data.text` vào câu trả lời tạm của UI.
+- `done`: đã lưu assistant hoàn chỉnh, thay tin nhắn tạm bằng `data.message`.
+- `error`: lỗi khi gọi Gemini hoặc lưu database, có `code`, `message`. HTTP 200 chưa có nghĩa hoàn tất; phải nhận `done`.
+
+FE dùng `fetch()` đọc `response.body`, không dùng `EventSource` cho POST body/Bearer header. Giữ buffer để ghép frame SSE có thể bị chia qua nhiều network chunks và dùng TextDecoder streaming cho tiếng Việt. Dùng AbortController để làm nút Stop.
+
+Lỗi trước stream trả JSON với HTTP status. Lỗi sau khi bắt đầu stream trả event `error`, ví dụ:
+
+```text
+event: error
+data: {"success":false,"code":"gemini_rate_limited","message":"Gemini đã hết quota hoặc đang giới hạn yêu cầu."}
+
+```
+
+Conversation/user message đã lưu được giữ lại khi stream lỗi hoặc FE ngắt; không lưu câu trả lời dở dang thành completed. Nếu database lỗi sau khi lưu assistant nhưng trước cập nhật timestamp, assistant có thể đã có trong DB dù FE nhận error. Không có idempotency key; gửi lại sẽ thêm user message mới.
+
+Timeout mỗi lượt 120 giây; mỗi truy vấn SQL tối đa khoảng 15 giây. Output tối đa 8192 token/100000 ký tự. Chỉ lưu assistant khi Gemini kết thúc `STOP`, cùng parent message ID, model, response ID/token usage nếu có; không lưu thought parts. Một lượt/conversation/process, gửi chồng trả 409; nhiều backend instance cần lock chia sẻ để bảo đảm thứ tự.
+
+## Lấy conversation
+
+`GET /api/conversations?limit=50&offset=0`, dùng Bearer token, không có body. Sắp xếp mới cập nhật trước.
 
 ```json
 {
@@ -58,139 +91,25 @@ Cả hai API GET trả JSON và yêu cầu `Authorization: Bearer <access_token>
 }
 ```
 
-Mỗi conversation có `id`, `user_id`, `title`, `model`, `created_at`, `updated_at`, `last_message_at`.
+Conversation có `id`, `user_id`, `title`, `model`, `created_at`, `updated_at`, `last_message_at`.
 
-**GET `/api/conversations/<conversation_id>/messages?limit=50&offset=0`** lấy messages của conversation, cũ trước mới sau. Backend kiểm tra chủ sở hữu trước khi đọc messages; ID không tồn tại hoặc thuộc người khác trả 404. UUID sai định dạng trả 400.
+## Lấy messages
+
+`GET /api/conversations/<conversation_id>/messages?limit=50&offset=0`, Bearer token, không có body. Sắp xếp cũ trước mới sau.
 
 ```json
 {
   "success": true,
   "data": {
-    "conversation_id": "UUID-cua-conversation",
+    "conversation_id": "uuid",
     "messages": [],
     "pagination": { "limit": 50, "offset": 0, "has_more": false }
   }
 }
 ```
 
-Mỗi message có `id`, `conversation_id`, `parent_message_id`, `role`, `content`, `status`, `provider`, `model`, `created_at`, `updated_at`. API này lấy lịch sử đã lưu để FE hiển thị, không áp dụng giới hạn context 40 tin/48000 ký tự của lời gọi Gemini.
+Mỗi message có `id`, `conversation_id`, `parent_message_id`, `role`, `content`, `status`, `provider`, `model`, `created_at`, `updated_at`. Lịch sử hiển thị không bị giới hạn 40 tin như context cho Gemini. Mặc định limit 50, tối đa 100; offset từ 0 đến 1000000. Khi `has_more=true`, tăng offset thêm limit. Danh sách trống trả 200 với mảng rỗng.
 
-Mặc định `limit=50`, tối đa 100, `offset` từ 0 đến 1000000. `has_more=true` thì gọi trang tiếp với `offset` tăng thêm `limit`. Danh sách trống trả 200 với mảng rỗng. Token thiếu/sai trả 401. Trong Postman chọn GET, URL như trên, Authorization → Bearer Token, không cần body.
+## Database
 
-## Chi tiết response SSE của send-messages
-
-Request hợp lệ bắt đầu trả HTTP **200** với `Content-Type: text/event-stream`. Mỗi event kết thúc bằng một dòng trống. Ví dụ:
-
-```text
-event: conversation
-data: {"conversation_id":"uuid","created":true,"user_message_id":"uuid"}
-
-event: delta
-data: {"text":"Xin chào! "}
-
-event: delta
-data: {"text":"Mình có thể giúp bạn."}
-
-event: done
-data: {"conversation_id":"uuid","message":{"id":"uuid","conversation_id":"uuid","role":"assistant","content":"Xin chào! Mình có thể giúp bạn.","created_at":"..."}}
-
-```
-
-- `conversation`: FE giữ ID để dùng lại; `created` cho biết vừa tạo mới hay dùng lại. Tin nhắn user đã được lưu trước event này.
-- `delta`: nối `text` vào câu trả lời đang hiển thị.
-- `done`: câu trả lời đã hoàn tất và được lưu trong `messages`; giữ ID message để thay thế bản tạm trên giao diện.
-- `error`: lỗi xảy ra sau khi stream bắt đầu, ví dụ quota, timeout hoặc lỗi lưu database. Không coi HTTP 200 là thành công hoàn chỉnh; phải nhận `done`.
-
-```text
-event: error
-data: {"success":false,"code":"gemini_rate_limited","message":"Gemini đã hết quota hoặc đang giới hạn yêu cầu."}
-
-```
-
-Nếu lỗi xảy ra trước khi stream bắt đầu, API trả HTTP status + JSON theo middleware hiện có: 400 (input), 401 (token), 404 (conversation), 409 (đang xử lý lượt khác), 503 (config/database). Một khi đã bắt đầu SSE thì HTTP status không đổi được; FE cần xử lý event `error`.
-
-## Test bằng cURL/Postman
-
-Đăng nhập trước để lấy `data.session.access_token`. PowerShell dùng `curl.exe`, thay token thật ở máy bạn:
-
-```powershell
-curl.exe -N -X POST 'http://localhost:3001/api/conversations/send-messages' `
-  -H 'Authorization: Bearer YOUR_ACCESS_TOKEN' `
-  -H 'Content-Type: application/json' `
-  --data-raw '{"message":"Xin chào!"}'
-```
-
-Trong Postman: POST cùng URL, Authorization → Bearer Token, Body → raw → JSON như trên. Đọc các event trong response. Để kiểm tra dùng lại conversation, gửi request tiếp theo với UUID nhận từ event `conversation`.
-
-## Gọi từ FE bằng fetch
-
-SSE ở route POST này cần `fetch()` + `response.body`; không dùng `EventSource` vì nó không gửi được POST body/Bearer header theo cách này. Đoạn dưới minh họa cách đọc các frame có thể bị tách qua nhiều network chunk:
-
-```ts
-async function sendMessage(
-  token: string,
-  message: string,
-  conversationId: string | undefined,
-  onEvent: (event: string, data: any) => void,
-  signal?: AbortSignal,
-) {
-  const response = await fetch('http://localhost:3001/api/conversations/send-messages', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ message, conversation_id: conversationId }),
-    signal,
-  });
-  if (!response.ok) throw await response.json();
-  if (!response.body) throw new Error('Không có response stream');
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let completed = false;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
-      let end: number;
-      while ((end = buffer.indexOf('\n\n')) !== -1) {
-        const frame = buffer.slice(0, end);
-        buffer = buffer.slice(end + 2);
-        const lines = frame.split('\n');
-        const event = lines.find(line => line.startsWith('event: '))?.slice(7);
-        const raw = lines.find(line => line.startsWith('data: '))?.slice(6);
-        if (!event || !raw) continue;
-        const data = JSON.parse(raw);
-        if (event === 'error') throw data;
-        if (event === 'done') completed = true;
-        onEvent(event, data);
-      }
-      if (done) break;
-    }
-    if (!completed) throw new Error('Kết nối ngắt trước khi câu trả lời hoàn tất');
-  } finally {
-    await reader.cancel().catch(() => undefined);
-    reader.releaseLock();
-  }
-}
-```
-
-Trong `onEvent`, lưu `data.conversation_id` khi nhận `conversation`, nối `data.text` khi nhận `delta`, và dùng `data.message` khi nhận `done`. Dùng `AbortController` để làm nút dừng. Đây là hướng dẫn tích hợp; code FE hiện tại chưa được thay đổi.
-
-## Database và xử lý khi lỗi
-
-Route dùng các bảng hiện có:
-
-- `conversations`: `id`, `user_id`, `title`, `model`, `updated_at`, `last_message_at`.
-- `messages`: `id`, `conversation_id`, `parent_message_id`, `role`, `content`, `status`, `provider`, `model`, `response_id`, `input_tokens`, `output_tokens`, `created_at`.
-
-`conversations.user_id` tham chiếu `profiles.id`, nên user đăng nhập phải có profile tương ứng (thường do trigger đăng ký tạo). Backend xác minh Bearer token với Supabase Auth để lấy user ID. Khi `.env` có `SUPABASE_SECRET_KEY`, truy vấn chat dùng client backend riêng với key này, không gắn token user vào client database. Backend gắn `user_id` từ token khi tạo conversation và kiểm tra `id` + `user_id` trước khi đọc lịch sử hoặc thêm message vào conversation hiện có. FE không được quyết định chủ sở hữu. Không có tính năng phân vai admin/user.
-
-Secret key chỉ ở server và có thể bỏ qua RLS, nên các bước kiểm tra chủ sở hữu trong backend là bắt buộc. Route không thay đổi GRANT hoặc RLS trên Supabase. Nếu không có secret key, client dùng token user và quyền/RLS của user vẫn áp dụng. Với RLS đang tắt, quyền truy cập trực tiếp qua Data API phụ thuộc GRANT của từng role; kiểm tra chủ sở hữu trong backend chỉ bảo vệ các request đi qua backend.
-
-Tin nhắn user lưu với `status = completed`. Câu trả lời assistant chỉ lưu khi Gemini kết thúc với `STOP`, kèm `parent_message_id` trỏ tới tin nhắn user, provider `google`, model, response ID và token usage nếu có. Không lưu suy nghĩ nội bộ (thought parts).
-
-Nếu Gemini lỗi, bị chặn, stream bị ngắt, đạt giới hạn output hoặc FE đóng kết nối, conversation và tin nhắn user đã lưu được giữ lại; câu trả lời dở dang không được lưu thành completed. Nếu FE đã có text tạm, hiển thị trạng thái bị ngắt khi nhận error/mất kết nối. Nếu database lỗi sau khi lưu assistant nhưng trước khi cập nhật timestamp, có thể đã có assistant trong DB dù FE nhận error. Route không có idempotency key; tự gửi lại request sẽ tạo thêm tin nhắn user.
-
-Giới hạn: timeout mỗi lượt 120 giây, output tối đa 8192 token/100000 ký tự. Mỗi conversation chỉ xử lý một lượt tại một thời điểm trong cùng process (lượt chồng trả 409). Nếu triển khai nhiều backend instance cần lock phân tán hoặc transaction/RPC để giữ thứ tự xuyên instance. Chưa có queue hoặc tự retry request có thể phát sinh chi phí Gemini.
-
-`npm.cmd test` chạy mock Supabase/Gemini, không ghi dữ liệu lên project thật hoặc gọi Google thật.
+Backend dùng `pg` kết nối trực tiếp PostgreSQL trên Supabase; mật khẩu nằm trong `DATABASE_URL`. Không gọi Supabase Auth, không dùng public/secret API key ở runtime. Các điều kiện user ID trong SQL bảo vệ conversation theo user; không cần phân vai admin/user. Dữ liệu auth/password hash nằm ở schema riêng `app_private`, không đặt ở các bảng public để tránh Data API đọc được.

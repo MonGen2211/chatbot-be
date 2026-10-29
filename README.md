@@ -1,108 +1,68 @@
 # AI Chat Backend
 
-Backend Express + TypeScript, có **POST /api/auth/login**, **POST /api/auth/register** và **POST /api/conversations/send-messages** (Gemini streaming).
+Express + TypeScript, truy vấn PostgreSQL trực tiếp bằng `pg`, tự quản lý auth bằng bcrypt + JWT và gọi Gemini streaming. PostgreSQL vẫn có thể host trên Supabase; backend không gọi Supabase Auth/Data API nữa.
 
-Lịch sử chat: **GET /api/conversations** lấy danh sách của user đăng nhập; **GET /api/conversations/:conversation_id/messages** lấy tin nhắn của conversation thuộc user đó. Cả hai yêu cầu Bearer token và hỗ trợ `limit`, `offset`.
+## Cấu hình và chạy
 
-## Chạy local
+Node.js 22 trở lên. Trong `ai-chat-be`, tạo `.env` theo `.env.example` nếu chưa có. Không copy đè `.env` đã điền key.
 
-Yêu cầu Node.js 22 trở lên. Trong thư mục `ai-chat-be`:
-
-```powershell
-npm install
-Copy-Item .env.example .env
-# Điền cấu hình .env trước khi chạy
-npm run dev
-```
-
-Mặc định API chạy tại `http://localhost:3001`. Frontend được phép gọi từ `http://localhost:5173`; đổi `CORS_ORIGIN` nếu frontend dùng địa chỉ khác.
-
-## Chỗ kết nối Supabase
-
-- **`.env`**: điền `SUPABASE_URL` và `SUPABASE_PUBLISHABLE_KEY` theo `.env.example`.
-- Lấy Project URL và publishable key từ Connect dialog hoặc phần API Keys trong Supabase Dashboard. Legacy `anon` key cũng dùng được. Backend hỗ trợ `SUPABASE_SECRET_KEY`; chỉ giữ key này phía server, không đưa vào frontend. Auth ưu tiên publishable key nếu cấu hình cả hai; client truy vấn chat ưu tiên secret key backend.
-- **`src/config/env.ts`**: đọc và kiểm tra biến môi trường.
-- **`src/config/supabase.ts`**: khởi tạo Supabase client. Đây là chỗ cấu hình kết nối.
-- SDK dùng HTTPS API của Supabase, không cần `DATABASE_URL`, password Postgres hay driver SQL cho route này.
-- Mỗi lần đăng nhập tạo client riêng để phiên của các user không dùng chung.
-
-SQL/schema hiện có trên Supabase được giữ nguyên. Các route auth xác thực tài khoản trong **Supabase Authentication**, không đọc mật khẩu từ bảng `public.users` hoặc `profiles` tự tạo. Route chat dùng `conversations` và `messages` hiện có, xác minh token rồi gắn/kiểm tra user ID của chủ sở hữu trước khi truy cập dữ liệu bằng kết nối backend. Chi tiết trong hướng dẫn API chat bên dưới.
-
-## Tạo tài khoản và test API
-
-Trong Supabase Dashboard, vào **Authentication → Users → Add user** để tạo email/password test. Xác nhận email tài khoản (hoặc chọn tự xác nhận khi tạo tài khoản test nếu giao diện hỗ trợ).
-
-Postman: method `POST`, URL `http://localhost:3001/api/auth/login`, header `Content-Type: application/json`, Body → raw → JSON:
-
-```json
-{
-  "email": "test@example.com",
-  "password": "your-test-password"
-}
-```
-
-Hoặc PowerShell:
+- `DATABASE_URL`: PostgreSQL URI từ Supabase → Connect → Session pooler, giống kết nối DBeaver. Điền mật khẩu database thật và URL-encode các ký tự đặc biệt trong mật khẩu. Đây không phải Supabase API key. Ưu tiên Session pooler cổng 5432; transaction pooler 6543 cũng hỗ trợ vì code không dùng prepared statement có tên.
+- `JWT_SECRET`: chuỗi ngẫu nhiên ít nhất 32 byte, giữ riêng trên backend. Đã tạo một secret ngẫu nhiên trong `.env` local nếu trước đó chưa có.
+- `JWT_EXPIRES_IN`: mặc định `1h`, cho phép từ 60 giây tới 7 ngày.
+- `GEMINI_API_KEY`, `GEMINI_MODEL`: key/model Google AI Studio, chỉ dùng ở backend.
+- `CORS_ORIGIN`: địa chỉ FE, mặc định `http://localhost:5173`.
 
 ```powershell
-$body = @{ email = 'test@example.com'; password = 'your-test-password' } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri 'http://localhost:3001/api/auth/login' -ContentType 'application/json' -Body $body
+npm.cmd install
+npm.cmd run db:check
+npm.cmd run db:migrate
+npm.cmd run db:types
+npm.cmd run dev
 ```
 
-Thành công trả `200`, `success: true`, `data.user` và `data.session` gồm access token, refresh token và thời gian hết hạn. Không chia sẻ token hoặc commit `.env`.
+`db:check` chỉ kiểm tra kết nối và bảng, không ghi dữ liệu. `db:migrate` thay đổi schema/copy tài khoản theo migration đã chuẩn bị. Chạy migration trước khi gọi API. API mặc định ở `http://localhost:3001`.
 
-| Status | Ý nghĩa |
-| --- | --- |
-| 400 | Thiếu/sai email, password hoặc JSON lỗi |
-| 401 | Email/mật khẩu không hợp lệ (`invalid_credentials`) |
-| 403 | Email chưa xác nhận hoặc tài khoản bị khóa |
-| 404 | Route không tồn tại |
-| 413 | Body quá lớn |
-| 429 | Supabase giới hạn số lần đăng nhập |
-| 503 | Supabase không khả dụng hoặc cấu hình key chưa đúng |
-| 502 | Supabase trả về lỗi không mong đợi, không phải lỗi sai mật khẩu |
+Kết nối database dùng TLS có kiểm tra chứng chỉ. Nếu gặp lỗi CA, tải certificate database trong Supabase và cấu hình `DATABASE_CA_FILE`; không tắt kiểm tra chứng chỉ. Pool giới hạn 5 kết nối, query có timeout và shutdown đóng pool. Không cần Supabase URL/publishable/secret API key ở runtime; các biến cũ trong `.env` có thể giữ tạm nhưng không được code dùng.
 
-`SUPABASE_URL` nên là URL gốc của project. Nếu dán endpoint có đuôi `/rest/v1/` hoặc `/auth/v1/`, backend tự chuẩn hóa về URL gốc. Secret key được hỗ trợ ở backend qua `SUPABASE_SECRET_KEY`; tên biến cũ vẫn được chấp nhận để tương thích cấu hình đã có. Sau khi sửa `.env`, dừng và chạy lại server. Khi dùng `npm start`, chạy `npm run build` trước để cập nhật bản build.
+## Chuyển tài khoản Supabase Auth cũ
 
-Lỗi đăng nhập có trường `code` để phân biệt nguyên nhân. Trong development, terminal chỉ ghi status/code/name của lỗi Supabase, không ghi email, mật khẩu hay token.
+Migration `migrations/001_local_auth.sql` chạy trong transaction, có bảng theo dõi và checksum để không chạy lặp:
 
-## Đăng ký tài khoản
+- Tạo `app_private.users` để lưu email, password hash, trạng thái tài khoản và token version. Schema này không được public qua Supabase Data API.
+- Copy user cũ từ `auth.users`, giữ nguyên UUID, hash bcrypt, trạng thái xác nhận email, khóa/xóa tài khoản.
+- Đổi khóa ngoại `profiles.id` sang `app_private.users.id`. Bảng profiles, conversations và messages cùng dữ liệu chat hiện có được giữ lại. Không xóa schema `auth` hay user cũ.
+- Người dùng email/password cũ đã xác nhận email có thể đăng nhập lại bằng mật khẩu cũ. Token Supabase cũ không còn được backend chấp nhận.
+- User chưa xác nhận email trước khi chuyển vẫn bị chặn; không tự bỏ trạng thái này. Tài khoản social/passwordless vẫn được giữ ID nhưng không thể đăng nhập bằng mật khẩu khi chưa có password hash. Chưa có API xác nhận email/đặt lại mật khẩu cho các trường hợp này.
+- Tài khoản đăng ký mới được tạo trong `app_private.users` cùng profile bằng một transaction; không ghi vào `auth.users`, không gửi email xác nhận và trả session ngay.
 
-Postman: **POST** `http://localhost:3001/api/auth/register`, Body → raw → JSON:
+Kiểm tra/backup database trước khi áp dụng migration lên môi trường có dữ liệu quan trọng. Nếu gặp email trùng khi chuẩn hóa chữ thường hoặc dữ liệu liên kết không hợp lệ, migration rollback thay vì bỏ qua/mất dữ liệu. Chỉ backend có DB credentials truy cập schema riêng. Không tiếp tục đăng ký qua Supabase Auth sau khi chuyển sang auth của backend.
 
-```json
-{
-  "email": "new-user@example.com",
-  "password": "YourStrongPassword123!"
-}
-```
+## APIs cho FE/Postman
 
-Mật khẩu tối thiểu 8 ký tự, giữ nguyên khoảng trắng nếu có. Supabase có thể yêu cầu chính sách mật khẩu mạnh hơn theo cấu hình project. Route tạo tài khoản Supabase Auth, không tự ghi vào bảng profile riêng; trigger SQL hiện có trên Supabase vẫn chạy bình thường.
+- `POST /api/auth/register`: `{ "email": "new@example.com", "password": "StrongPassword123!" }`, trả 201.
+- `POST /api/auth/login`: `{ "email": "new@example.com", "password": "StrongPassword123!" }`, trả 200.
+- `GET /api/conversations?limit=50&offset=0`: conversation của user đăng nhập.
+- `GET /api/conversations/:conversation_id/messages?limit=50&offset=0`: lịch sử của conversation thuộc user đó.
+- `POST /api/conversations/send-messages`: Gemini SSE. Body `{ "message": "...", "conversation_id": "UUID nếu chat tiếp" }`.
 
-- **201**: đăng ký có session (khi project không yêu cầu xác nhận email). `data.user` và `data.session` có dữ liệu, `email_confirmation_required: false`.
-- **202**: yêu cầu được tiếp nhận, cần kiểm tra email. `data.user` và `data.session` là `null`, `email_confirmation_required: true`. Không khẳng định tài khoản mới đã được tạo, vì Supabase có thể che giấu email đã tồn tại. Xác nhận email rồi gọi route login.
-- **400**: đầu vào không hợp lệ, mật khẩu yếu hoặc email không được phép nhận thư.
-- **403**: Supabase tắt đăng ký/email provider.
-- **409**: Supabase trả rõ lỗi email đã tồn tại. Khi bật xác nhận email, có thể trả 202 thay vì 409.
-- **429**: vượt giới hạn đăng ký/gửi email.
-- **502/503**: lỗi Supabase/cấu hình/dịch vụ không khả dụng.
+Auth trả `data.user` và `data.session.access_token`, `token_type`, `expires_in`, `expires_at`. FE tiếp tục dùng `Authorization: Bearer <access_token>` cho chat/history. Không có refresh token; hết hạn thì đăng nhập lại. Chưa triển khai logout server, refresh, quên mật khẩu hoặc xác nhận email. Đăng ký mật khẩu tối thiểu 8 ký tự, tối đa 72 byte UTF-8 vì bcrypt. Login dùng email không phân biệt chữ hoa/thường và mật khẩu giữ nguyên khoảng trắng.
 
-Trong Supabase Authentication, bật cho phép đăng ký user mới và email/password provider. Cấu hình Site URL cho link xác nhận; route dùng luồng email mặc định của Supabase, không tự xác nhận email hoặc gọi API admin. Nếu bật CAPTCHA, cần bổ sung luồng CAPTCHA trước khi dùng route này. Không cần đổi key đang dùng trong `.env`.
+Đăng nhập/đăng ký giới hạn chung 30 request/15 phút/IP trong mỗi process. Chưa cấu hình trust proxy; khi triển khai sau reverse proxy cần thiết lập đúng địa chỉ proxy tin cậy và cân nhắc store rate-limit dùng chung nếu có nhiều instance.
 
-Tài liệu: [Supabase signUp](https://supabase.com/docs/reference/javascript/auth-signup).
+Backend lấy ID chủ sở hữu từ JWT đã xác minh và kiểm tra tài khoản còn hoạt động. Không lấy `user_id` từ body/query. Mọi truy vấn chat có điều kiện user ID; không có phân vai admin/user. Database vẫn kiểm tra quyền kết nối, khóa ngoại và constraints. Backend không tự tắt/bật RLS trên các bảng chat.
 
-## Gửi tin nhắn và stream Gemini
+Chi tiết: [send-messages.md](docs/send-messages.md).
 
-Xem [hướng dẫn API chat](docs/send-messages.md) để cấu hình Gemini, gọi từ Postman/cURL/FE và đọc stream SSE. Route dùng bảng `conversations` và `messages` hiện có; không cần tạo bảng mới.
+## Types và kiểm tra
 
-## Lệnh khác
+`npm.cmd run db:types` đọc metadata `information_schema`/PostgreSQL để sinh types cho các bảng public vào `src/types/database.types.ts`. Không đọc nội dung tài khoản/tin nhắn, không cần Supabase CLI/API key. Generator hỗ trợ columns, nullability, defaults, enum values và kiểu dữ liệu đang dùng; chưa sinh join Relationships, views hoặc RPC. `chat.types.ts` giữ DTO request/response/streaming dựa trên types public. Các query `pg` dùng generic Row type và tham số `$1`, `$2`; schema types không tự kiểm tra cú pháp SQL lúc compile.
 
 ```powershell
-npm run typecheck
-npm test
-npm run build
-npm start
+npm.cmd run build
+npm.cmd test
+npm.cmd start
 ```
 
-`npm start` chạy bản đã build trong `dist/`. Chưa triển khai đăng xuất, refresh token hoặc xóa lịch sử chat.
+Các file test hiện có đã chuyển sang giả lập PostgreSQL và Gemini, không ghi vào database thật và không gọi Google. Kiểm tra thật cần `DATABASE_URL` hợp lệ và migration đã chạy. `npm start` dùng bản build trong `dist/`.
 
-Tài liệu: [Supabase password login](https://supabase.com/docs/reference/javascript/auth-signinwithpassword), [API keys](https://supabase.com/docs/guides/getting-started/api-keys).
+Tài liệu: [node-postgres queries](https://node-postgres.com/features/queries), [Supabase PostgreSQL connections](https://supabase.com/docs/guides/database/connecting-to-postgres).

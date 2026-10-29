@@ -7,7 +7,7 @@ export function databaseError(operation: string, error: DatabaseError | null): H
   // details, which can contain messages, credentials, or other personal data.
   const code = error?.code && /^[A-Z0-9]{5,12}$/.test(error.code) ? error.code : 'unknown';
   const constraint = error?.message?.match(/constraint "([A-Za-z0-9_]+)"/)?.[1];
-  console.error('Supabase database operation failed:', { operation, code, ...(constraint ? { constraint } : {}) });
+  console.error('PostgreSQL database operation failed:', { operation, code, ...(constraint ? { constraint } : {}) });
   switch (code) {
     case '42501':
       return new HttpError(403, 'Database từ chối quyền truy cập (42501). Kiểm tra quyền bảng của kết nối backend; tắt RLS không tự cấp quyền bảng.', 'database_permission_denied');

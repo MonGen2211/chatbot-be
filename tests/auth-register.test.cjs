@@ -1,103 +1,83 @@
 const assert = require('node:assert/strict');
-const http = require('node:http');
+const { randomUUID } = require('node:crypto');
 const { test } = require('node:test');
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
-test('registration forwards credentials and handles Supabase responses', async () => {
-  const requests = [];
-  let scenario = 'confirmed';
-  const user = { id: 'test-user', email: 'new@example.com', aud: 'authenticated', created_at: new Date().toISOString() };
-  const session = { access_token: 'test-access', refresh_token: 'test-refresh', expires_in: 3600, token_type: 'bearer', user };
-  const upstream = http.createServer(async (req, res) => {
-    let body = '';
-    for await (const chunk of req) body += chunk;
-    requests.push({ url: req.url, body: JSON.parse(body) });
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('X-Supabase-Api-Version', '2024-01-01');
-    const errors = {
-      duplicate: [422, 'user_already_exists'],
-      weak: [422, 'weak_password'],
-      disabled: [403, 'signup_disabled'],
-      limited: [429, 'over_email_send_rate_limit'],
-      invalidEmail: [400, 'email_address_invalid'],
-      key: [401, 'invalid_api_key'],
-      down: [500, 'unexpected_failure'],
-      unknown: [404, 'unexpected_failure'],
-    };
-    if (errors[scenario]) {
-      const [status, code] = errors[scenario];
-      res.writeHead(status);
-      res.end(JSON.stringify({ code, error_code: code, msg: 'Mock error' }));
-      return;
+test('PostgreSQL registration/login, transactions and local JWT authentication', async () => {
+  process.env.DATABASE_URL = 'postgresql://test:test@localhost:5432/test?sslmode=disable';
+  process.env.JWT_SECRET = 'test-only-secret-with-at-least-32-bytes';
+  process.env.JWT_EXPIRES_IN = '1h';
+  let users = [];
+  let profileFailure = false;
+  let before;
+  const calls = [];
+  const originalQuery = Pool.prototype.query;
+  const originalConnect = Pool.prototype.connect;
+  async function mockQuery(sql, values = []) {
+    calls.push({ sql, values });
+    if (sql === 'BEGIN') before = users.slice();
+    if (sql === 'ROLLBACK') users = before;
+    if (sql.startsWith('INSERT INTO app_private.users')) {
+      if (users.some(user => user.email === values[0].toLowerCase())) throw Object.assign(new Error('duplicate'), { code: '23505' });
+      const user = { id: randomUUID(), email: values[0].toLowerCase(), password_hash: values[1], email_verified: true, banned_until: null, deleted_at: null, token_version: 0 };
+      users.push(user); return { rows: [user] };
     }
-    const result = scenario === 'confirmed' || scenario === 'login'
-      ? session
-      : scenario === 'obfuscated' ? { ...user, identities: [] } : user;
-    res.end(JSON.stringify(result));
-  });
-  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
-  process.env.SUPABASE_URL = `http://127.0.0.1:${upstream.address().port}`;
-  process.env.SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_mock';
-  process.env.NODE_ENV = 'production';
+    if (sql.startsWith('INSERT INTO public.profiles') && profileFailure) throw Object.assign(new Error('profile failed'), { code: '23503' });
+    if (sql.includes('FROM app_private.users WHERE lower(email)')) return { rows: users.filter(user => user.email === values[0].toLowerCase()) };
+    if (sql.includes('FROM app_private.users WHERE id')) return { rows: users.filter(user => user.id === values[0]) };
+    return { rows: [] };
+  }
+  Pool.prototype.query = mockQuery;
+  Pool.prototype.connect = async () => ({ query: mockQuery, release() {} });
   const { app } = require('../dist/app');
   const server = app.listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
-  async function post(body, route = 'register') {
-    return fetch(`${base}/api/auth/${route}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
-  }
-
+  const post = (route, body) => fetch(base + route, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   try {
-    const input = { email: ' new@example.com ', password: ' StrongPassword123! ', role: 'admin' };
-    let response = await post(input);
+    const credentials = { email: 'Test@Example.com', password: 'StrongPassword123!' };
+    let response = await post('/api/auth/register', credentials);
     assert.equal(response.status, 201);
+    const registration = await response.json();
+    assert.equal(registration.data.email_confirmation_required, false);
+    assert.equal(registration.data.session.refresh_token, undefined);
+    assert.notEqual(users[0].password_hash, credentials.password);
+    assert.equal(await bcrypt.compare(credentials.password, users[0].password_hash), true);
+    assert.equal(calls.some(call => call.sql === 'COMMIT'), true);
+    assert.equal(calls.some(call => call.sql.includes('INSERT INTO public.profiles')), true);
+    const token = registration.data.session.access_token;
+    const claims = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'], issuer: 'ai-chat-be', audience: 'ai-chat-ui' });
+    assert.equal(claims.sub, users[0].id);
+    assert.equal(claims.ver, 0);
     assert.equal(response.headers.get('cache-control'), 'no-store');
-    let result = await response.json();
-    assert.equal(result.data.session.access_token, 'test-access');
-    assert.equal(result.data.email_confirmation_required, false);
-    assert.equal(requests[0].url, '/auth/v1/signup');
-    assert.equal(requests[0].body.email, 'new@example.com');
-    assert.equal(requests[0].body.password, input.password);
-    assert.equal(requests[0].body.role, undefined);
-    assert.equal(requests[0].body.email_confirm, undefined);
-
-    for (scenario of ['pending', 'obfuscated']) {
-      response = await post(input);
-      assert.equal(response.status, 202);
-      result = await response.json();
-      assert.equal(result.data.session, null);
-      assert.equal(result.data.user, null);
-      assert.equal(result.data.email_confirmation_required, true);
-    }
-    const callsBeforeValidation = requests.length;
-    for (const invalid of [null, [], {}, { email: 'bad', password: 'password123' }, { email: user.email, password: 'short' }, { email: user.email, password: 12345678 }]) {
-      assert.equal((await post(invalid)).status, 400);
-    }
-    assert.equal(requests.length, callsBeforeValidation);
-
-    for (const [name, status, code] of [
-      ['duplicate', 409, 'email_exists'], ['weak', 400, 'weak_password'],
-      ['disabled', 403, 'signup_disabled'], ['limited', 429, 'auth_rate_limited'],
-      ['invalidEmail', 400, 'invalid_signup_email'], ['key', 503, 'auth_unavailable'],
-      ['down', 503, 'auth_unavailable'], ['unknown', 502, 'auth_upstream_error'],
-    ]) {
-      scenario = name;
-      response = await post(input);
-      assert.equal(response.status, status, name);
-      assert.equal((await response.json()).code, code, name);
-    }
-    scenario = 'login';
-    response = await post(input, 'login');
+    response = await post('/api/auth/login', { ...credentials, email: 'test@example.com' });
     assert.equal(response.status, 200);
-    assert.equal((await response.json()).data.session.access_token, 'test-access');
-    assert.equal(requests.at(-1).url, '/auth/v1/token?grant_type=password');
+    assert.equal((await response.json()).data.user.id, users[0].id);
+    assert.equal((await post('/api/auth/register', credentials)).status, 409);
+    assert.equal((await post('/api/auth/login', { ...credentials, password: 'wrong' })).status, 401);
+    assert.equal((await post('/api/auth/login', { ...credentials, email: 'missing@example.com' })).status, 401);
+    for (const body of [null, [], {}, { email: 'bad', password: credentials.password }, { ...credentials, password: 'short' }, { ...credentials, password: 'a'.repeat(73) }]) {
+      assert.equal((await post('/api/auth/register', body)).status, 400);
+    }
+    profileFailure = true;
+    assert.equal((await post('/api/auth/register', { ...credentials, email: 'rollback@example.com' })).status, 409);
+    assert.equal(users.length, 1);
+    profileFailure = false;
+    for (const [field, value, status] of [['email_verified', false, 403], ['banned_until', '2999-01-01T00:00:00Z', 403], ['deleted_at', '2026-01-01T00:00:00Z', 401]]) {
+      const old = users[0][field]; users[0][field] = value;
+      assert.equal((await post('/api/auth/login', credentials)).status, status);
+      users[0][field] = old;
+    }
+    assert.equal((await fetch(base + '/api/conversations', { headers: { Authorization: `Bearer ${token}` } })).status, 200);
+    const expired = jwt.sign({ ver: 0 }, process.env.JWT_SECRET, { subject: users[0].id, issuer: 'ai-chat-be', audience: 'ai-chat-ui', expiresIn: -1 });
+    const wrongIssuer = jwt.sign({ ver: 0 }, process.env.JWT_SECRET, { subject: users[0].id, issuer: 'supabase', audience: 'ai-chat-ui', expiresIn: 60 });
+    for (const bad of [expired, wrongIssuer, token + 'bad']) assert.equal((await fetch(base + '/api/conversations', { headers: { Authorization: `Bearer ${bad}` } })).status, 401);
+    users[0].token_version++;
+    assert.equal((await fetch(base + '/api/conversations', { headers: { Authorization: `Bearer ${token}` } })).status, 401);
   } finally {
-    server.closeAllConnections();
-    upstream.closeAllConnections();
-    await Promise.all([
-      new Promise(resolve => server.close(resolve)),
-      new Promise(resolve => upstream.close(resolve)),
-    ]);
+    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+    Pool.prototype.query = originalQuery; Pool.prototype.connect = originalConnect;
   }
 });

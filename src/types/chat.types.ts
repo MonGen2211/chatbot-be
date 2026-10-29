@@ -3,31 +3,17 @@ export interface SendMessageInput {
   conversation_id?: string;
 }
 
-export interface ChatMessage {
-  id: string;
-  conversation_id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  created_at: string;
-}
+export type ChatMessage = Pick<Tables<'messages'>,
+  'id' | 'conversation_id' | 'role' | 'content' | 'created_at'>;
 
-export interface ConversationSummary {
-  id: string;
-  user_id: string;
-  title: string;
-  model: string | null;
-  created_at: string;
-  updated_at: string;
-  last_message_at: string | null;
-}
+export type ConversationSummary = Tables<'conversations'>;
 
-export interface StoredMessage extends ChatMessage {
-  parent_message_id: string | null;
-  status: string;
-  provider: string | null;
-  model: string | null;
-  updated_at: string;
-}
+export type StoredMessage = Pick<Tables<'messages'>,
+  keyof ChatMessage | 'parent_message_id' | 'status' | 'provider' | 'model' | 'updated_at'>;
+
+// Only provider metadata is accepted here; ownership and content are set by BE.
+export type MessageMetadata = Pick<TablesInsert<'messages'>,
+  'parent_message_id' | 'provider' | 'model' | 'response_id' | 'input_tokens' | 'output_tokens'>;
 
 export interface PaginationInput {
   limit: number;
@@ -38,3 +24,5 @@ export type ChatEvent =
   | { event: 'conversation'; data: { conversation_id: string; created: boolean; user_message_id: string } }
   | { event: 'delta'; data: { text: string } }
   | { event: 'done'; data: { conversation_id: string; message: ChatMessage } };
+import type { Tables, TablesInsert } from './database.types';
+
