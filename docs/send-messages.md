@@ -23,7 +23,7 @@ User ID lấy từ JWT đã xác minh; FE không gửi `user_id`. Conversation k
 
 ## Gửi message
 
-`POST /api/conversations/send-messages`
+`POST /api/chat`. URL cũ `POST /api/conversations/send-messages` vẫn dùng được và trả cùng response.
 
 Chat mới:
 
@@ -95,7 +95,7 @@ Conversation có `id`, `user_id`, `title`, `model`, `created_at`, `updated_at`, 
 
 ## Lấy messages
 
-`GET /api/conversations/<conversation_id>/messages?limit=50&offset=0`, Bearer token, không có body. Sắp xếp cũ trước mới sau.
+`GET /api/messages?conversation_id=<conversation_id>&limit=50&offset=0`, Bearer token, không có body. URL cũ `GET /api/conversations/<conversation_id>/messages?limit=50&offset=0` vẫn hoạt động. Sắp xếp cũ trước mới sau.
 
 ```json
 {

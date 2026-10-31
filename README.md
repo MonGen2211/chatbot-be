@@ -42,8 +42,12 @@ Kiểm tra/backup database trước khi áp dụng migration lên môi trường
 - `POST /api/auth/register`: `{ "email": "new@example.com", "password": "StrongPassword123!" }`, trả 201.
 - `POST /api/auth/login`: `{ "email": "new@example.com", "password": "StrongPassword123!" }`, trả 200.
 - `GET /api/conversations?limit=50&offset=0`: conversation của user đăng nhập.
-- `GET /api/conversations/:conversation_id/messages?limit=50&offset=0`: lịch sử của conversation thuộc user đó.
-- `POST /api/conversations/send-messages`: Gemini SSE. Body `{ "message": "...", "conversation_id": "UUID nếu chat tiếp" }`.
+- `GET /api/messages?conversation_id=UUID&limit=50&offset=0`: lịch sử của conversation thuộc user đó.
+- `POST /api/chat`: gửi message và nhận Gemini SSE. Body `{ "message": "...", "conversation_id": "UUID nếu chat tiếp" }`.
+
+Hai URL cũ `GET /api/conversations/:conversation_id/messages` và `POST /api/conversations/send-messages` vẫn hoạt động, dùng cùng handler/response để FE cũ không cần sửa ngay.
+
+Code chia ba phần, mỗi phần có route/controller/service/types riêng: Conversation quản lý danh sách và metadata cuộc trò chuyện; Message đọc/ghi messages; Chat điều phối tạo/dùng lại conversation, lịch sử, Gemini và streaming. `conversation.repository.ts` chỉ truy vấn conversations; `message.repository.ts` đọc/ghi messages, có điều kiện kiểm tra chủ sở hữu trong SQL. Không thêm bảng chat hoặc thay đổi schema. Tạo conversation/message vẫn qua Chat; chưa thêm API CRUD riêng, retry hoặc sửa/xóa.
 
 Auth trả `data.user` và `data.session.access_token`, `token_type`, `expires_in`, `expires_at`. FE tiếp tục dùng `Authorization: Bearer <access_token>` cho chat/history. Không có refresh token; hết hạn thì đăng nhập lại. Chưa triển khai logout server, refresh, quên mật khẩu hoặc xác nhận email. Đăng ký mật khẩu tối thiểu 8 ký tự, tối đa 72 byte UTF-8 vì bcrypt. Login dùng email không phân biệt chữ hoa/thường và mật khẩu giữ nguyên khoảng trắng.
 
@@ -52,6 +56,8 @@ Auth trả `data.user` và `data.session.access_token`, `token_type`, `expires_i
 Backend lấy ID chủ sở hữu từ JWT đã xác minh và kiểm tra tài khoản còn hoạt động. Không lấy `user_id` từ body/query. Mọi truy vấn chat có điều kiện user ID; không có phân vai admin/user. Database vẫn kiểm tra quyền kết nối, khóa ngoại và constraints. Backend không tự tắt/bật RLS trên các bảng chat.
 
 Chi tiết: [send-messages.md](docs/send-messages.md).
+
+Mô tả để gửi cho FE: [frontend-api.md](docs/frontend-api.md).
 
 ## Types và kiểm tra
 

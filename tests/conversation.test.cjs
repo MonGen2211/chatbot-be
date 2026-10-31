@@ -43,6 +43,7 @@ test('PostgreSQL chat ownership, pagination, Gemini streaming and cancellation',
     if (!String(url).startsWith('https://generativelanguage.googleapis.com/')) return originalFetch(url, options);
     requests.push(JSON.parse(options.body));
     if (mode === 'quota') return new Response('{}', { status: 429 });
+    if (mode === 'unavailable') return new Response(JSON.stringify({ error: { status: 'UNAVAILABLE' } }), { status: 503 });
     if (mode === 'incomplete') return new Response(frame({ candidates: [{ content: { parts: [{ text: 'Partial' }] } }] }));
     if (mode === 'slow') return new Response(new ReadableStream({ start(controller) {
       controller.enqueue(frame({ candidates: [{ content: { parts: [{ text: 'First' }] } }] }));
@@ -57,7 +58,7 @@ test('PostgreSQL chat ownership, pagination, Gemini streaming and cancellation',
   const server = app.listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const send = (body, bearer = token, signal) => originalFetch(base + '/api/conversations/send-messages', {
+  const send = (body, bearer = token, signal, route = '/api/conversations/send-messages') => originalFetch(base + route, {
     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` }, body: JSON.stringify(body), signal,
   });
   const events = text => text.trim().split('\n\n').map(s => ({ event: s.split('\n')[0].slice(7), data: JSON.parse(s.split('\n')[1].slice(6)) }));
@@ -90,10 +91,11 @@ test('PostgreSQL chat ownership, pagination, Gemini streaming and cancellation',
     response = await get(`/api/conversations/${id}/messages?limit=1&offset=0`);
     const page = (await response.json()).data;
     assert.equal(page.messages.length, 1); assert.equal(page.pagination.has_more, true);
-    for (mode of ['quota', 'incomplete']) {
+    for (mode of ['quota', 'unavailable', 'incomplete']) {
       const count = messages.filter(m => m.role === 'assistant').length;
       const stream = events(await (await send({ message: 'failure', conversation_id: id })).text());
       assert.equal(stream.at(-1).event, 'error');
+      if (mode === 'unavailable') assert.equal(stream.at(-1).data.code, 'gemini_unavailable');
       assert.equal(messages.filter(m => m.role === 'assistant').length, count);
     }
     mode = 'slow';
@@ -120,6 +122,22 @@ test('PostgreSQL chat ownership, pagination, Gemini streaming and cancellation',
       await new Promise(r => setTimeout(r, 10));
     } while (true);
     assert.equal(events(await retry.text()).at(-1).event, 'done');
+    // Dedicated module routes expose the same contract as existing FE routes.
+    response = await get(`/api/messages?conversation_id=${id}&limit=1&offset=0`);
+    assert.equal(response.status, 200);
+    const messagePage = (await response.json()).data;
+    assert.equal(messagePage.conversation_id, id);
+    assert.equal(messagePage.messages.length, 1);
+    assert.equal(messagePage.pagination.has_more, true);
+    assert.equal((await get('/api/messages')).status, 400);
+    assert.equal((await get('/api/messages?conversation_id=invalid')).status, 400);
+    assert.equal((await get(`/api/messages?conversation_id=${foreign.id}`)).status, 404);
+    response = await send({ message: 'new chat via dedicated route' }, token, undefined, '/api/chat');
+    assert.equal(response.status, 200);
+    const dedicatedEvents = events(await response.text());
+    assert.equal(dedicatedEvents[0].data.created, true);
+    assert.equal(dedicatedEvents.at(-1).event, 'done');
+    assert.equal((await send({ message: 'hello' }, 'invalid', undefined, '/api/chat')).status, 401);
   } finally {
     global.fetch = originalFetch; Pool.prototype.query = originalQuery;
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
