@@ -5,6 +5,8 @@ import { env } from './config/env';
 import { errorHandler, notFound } from './middlewares/error.middleware';
 import { authRouter } from './routes/auth.routes';
 import { conversationRouter } from './routes/conversation.routes';
+import { messageRouter, legacyMessageRouter } from './routes/message.routes';
+import { chatRouter, legacyChatRouter } from './routes/chat.routes';
 
 export const app = express();
 app.disable('x-powered-by');
@@ -13,5 +15,9 @@ app.use(cors({ origin: env.corsOrigin }));
 app.use(express.json({ limit: '64kb' }));
 app.use('/api/auth', authRouter);
 app.use('/api/conversations', conversationRouter);
+app.use('/api/messages', messageRouter);
+app.use('/api/chat', chatRouter);
+app.use('/api/conversations', legacyChatRouter);
+app.use('/api/conversations/:conversation_id/messages', legacyMessageRouter);
 app.use(notFound);
 app.use(errorHandler);
