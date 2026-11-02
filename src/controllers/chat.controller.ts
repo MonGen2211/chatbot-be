@@ -1,8 +1,9 @@
-import type { RequestHandler, Response } from 'express';
+import type { RequestHandler, Response, Request } from 'express';
 import { HttpError } from '../middlewares/error.middleware';
 import type { AuthContext } from '../middlewares/auth.middleware';
-import { sendMessage } from '../services/chat.service';
-import { validateSendMessage } from '../validators/chat.validator';
+import { sendMessage, retryMessage, editMessage } from '../services/chat.service';
+import { validateSendMessage, validateEditMessage, validateMessageId } from '../validators/chat.validator';
+import type { ChatEvent } from '../types/chat.types';
 
 async function writeEvent(res: Response, event: string, data: unknown, signal: AbortSignal) {
   signal.throwIfAborted();
@@ -17,15 +18,14 @@ async function writeEvent(res: Response, event: string, data: unknown, signal: A
   });
 }
 
-export const sendMessageController: RequestHandler = async (req, res) => {
-  const input = validateSendMessage(req.body);
+async function streamResponse(req: Request, res: Response, operation: (signal: AbortSignal) => AsyncIterable<ChatEvent>) {
   const abort = new AbortController();
   const closed = () => { if (!res.writableFinished) abort.abort(); };
   res.once('close', closed);
-  const timer = setTimeout(() => abort.abort(new Error('generation_timeout')), 120000);
+  const timer = setTimeout(() => abort.abort(new Error('generation_timeout')), 180000);
   timer.unref();
   try {
-    for await (const item of sendMessage(input, res.locals.auth as AuthContext, abort.signal)) {
+    for await (const item of operation(abort.signal)) {
       if (!res.headersSent) {
         res.status(200).set({ 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no' });
         res.flushHeaders();
@@ -46,4 +46,18 @@ export const sendMessageController: RequestHandler = async (req, res) => {
     res.off('close', closed);
     abort.abort();
   }
+}
+
+export const sendMessageController: RequestHandler = async (req, res) => {
+  const input = validateSendMessage(req.body);
+  await streamResponse(req, res, signal => sendMessage(input, res.locals.auth as AuthContext, signal));
+};
+export const retryMessageController: RequestHandler = async (req, res) => {
+  const id = validateMessageId(req.params.message_id);
+  await streamResponse(req, res, signal => retryMessage(id, res.locals.auth as AuthContext, signal));
+};
+export const editMessageController: RequestHandler = async (req, res) => {
+  const id = validateMessageId(req.params.message_id);
+  const content = validateEditMessage(req.body);
+  await streamResponse(req, res, signal => editMessage(id, content, res.locals.auth as AuthContext, signal));
 };

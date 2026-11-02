@@ -11,3 +11,4 @@ export const getMessagesController: RequestHandler = async (req, res) => {
   const data = await getMessages(res.locals.auth as AuthContext, conversationId, pagination, AbortSignal.timeout(15000));
   res.status(200).json({ success: true, data });
 };
+

@@ -2,8 +2,9 @@ import { env } from '../config/env';
 import { CHAT_DEVELOPER_PROMPT } from '../config/chat-prompt';
 import { HttpError } from '../middlewares/error.middleware';
 import type { ChatMessage } from '../types/message.types';
+import { AiError, retryStream, type RetryOptions } from './ai-retry.service';
 
-interface GeminiChunk {
+export interface GeminiChunk {
   error?: unknown;
   promptFeedback?: { blockReason?: string };
   candidates?: Array<{ content?: { parts?: Array<{ text?: string; thought?: boolean }> }; finishReason?: string }>;
@@ -16,11 +17,17 @@ export function assertGeminiConfigured() {
   if (!/^[a-zA-Z0-9._-]+$/.test(env.geminiModel)) throw new HttpError(503, 'GEMINI_MODEL không hợp lệ.', 'gemini_not_configured');
 }
 
-export async function* streamGemini(history: ChatMessage[], message: string, signal: AbortSignal): AsyncGenerator<GeminiChunk> {
+export function streamGemini(history: ChatMessage[], message: string, signal: AbortSignal, model = env.geminiModel, options: RetryOptions = {}) {
+  return retryStream(attemptSignal => streamAttempt(history, message, attemptSignal, model), signal, options);
+}
+
+async function* streamAttempt(history: ChatMessage[], message: string, signal: AbortSignal, model: string): AsyncGenerator<GeminiChunk> {
   assertGeminiConfigured();
   const contents = [...history.map(item => ({ role: item.role === 'assistant' ? 'model' : 'user', parts: [{ text: item.content }] })),
     { role: 'user', parts: [{ text: message }] }];
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${env.geminiModel}:streamGenerateContent?alt=sse`, {
+  let response: Response;
+  try {
+    response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.geminiApiKey },
     body: JSON.stringify({
@@ -30,32 +37,38 @@ export async function* streamGemini(history: ChatMessage[], message: string, sig
     }),
     signal,
   });
-  if (!response.ok) {
-    // Only retain provider metadata; raw bodies may contain prompt/key details.
-    const failure = await response.json().catch(() => null) as {
-      error?: { status?: string; details?: Array<{ reason?: string }> };
-    } | null;
-    const providerStatus = failure?.error?.status;
-    const safeStatus = typeof providerStatus === 'string' && /^[A-Z_]{1,50}$/.test(providerStatus) ? providerStatus : undefined;
-    console.warn('Gemini request failed:', { httpStatus: response.status, providerStatus: safeStatus });
-    if (response.status === 429) throw new HttpError(429, 'Gemini đã hết quota hoặc đang giới hạn yêu cầu.', 'gemini_rate_limited');
-    if (response.status === 503) throw new HttpError(503, 'Gemini đang quá tải hoặc tạm thời không khả dụng. Vui lòng thử lại sau.', 'gemini_unavailable');
-    if (response.status === 500 || response.status === 504) throw new HttpError(503, 'Dịch vụ Gemini gặp lỗi tạm thời. Vui lòng thử lại sau.', 'gemini_unavailable');
-    if (response.status === 401 || response.status === 403) throw new HttpError(502, 'Google từ chối API key hoặc quyền truy cập Gemini. Kiểm tra key trong backend.', 'gemini_permission_denied');
-    if (response.status === 404) throw new HttpError(502, 'Không tìm thấy model Gemini hoặc key không có quyền dùng model này. Kiểm tra GEMINI_MODEL.', 'gemini_model_not_found');
-    if (response.status === 400) throw new HttpError(502, 'Gemini không chấp nhận cấu hình request hoặc điều kiện sử dụng của project. Kiểm tra mã lỗi provider trong terminal backend.', 'gemini_invalid_request');
-    throw new HttpError(502, 'Gemini trả về lỗi không mong đợi. Kiểm tra mã HTTP trong terminal backend.', 'gemini_upstream_error');
+  } catch {
+    if (signal.aborted) throw signal.reason;
+    throw new AiError('ai_network_error');
   }
-  if (!response.body) throw new HttpError(502, 'Gemini không trả về response stream.', 'gemini_invalid_stream');
-
+  if (!response.ok) {
+    const retryAfter = response.headers.get('retry-after');
+    await response.body?.cancel().catch(() => undefined);
+    console.warn('Gemini request failed:', { httpStatus: response.status });
+    throw new AiError('ai_provider_error', response.status, retryAfter);
+  }
+  if (!response.body) throw new AiError('ai_invalid_stream');
+  let finished = false;
+  let hasText = false;
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   function parse(frame: string): GeminiChunk | undefined {
     const text = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
     if (!text || text === '[DONE]') return;
-    try { return JSON.parse(text) as GeminiChunk; }
-    catch { throw new HttpError(502, 'Stream Gemini không hợp lệ.', 'gemini_invalid_stream'); }
+    try {
+      const chunk = JSON.parse(text) as GeminiChunk;
+      if (chunk.error) throw new AiError('ai_provider_error', (chunk.error as { code?: number }).code);
+      const candidate = chunk.candidates?.[0];
+      if (chunk.promptFeedback?.blockReason) throw new AiError('ai_blocked');
+      if (candidate?.finishReason) {
+        if (candidate.finishReason !== 'STOP') throw new AiError('ai_incomplete');
+        finished = true;
+      }
+      if (candidate?.content?.parts?.some(part => !part.thought && part.text?.trim())) hasText = true;
+      return chunk;
+    }
+    catch (error) { if (error instanceof AiError) throw error; throw new AiError('ai_invalid_stream'); }
   }
   try {
     while (true) {
@@ -63,7 +76,7 @@ export async function* streamGemini(history: ChatMessage[], message: string, sig
       buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
       // Normalize after combining buffers so CRLF split across chunks is handled.
       buffer = buffer.replace(/\r\n/g, '\n');
-      if (buffer.length > 1024 * 1024) throw new HttpError(502, 'Chunk Gemini quá lớn.', 'gemini_invalid_stream');
+      if (buffer.length > 1024 * 1024) throw new AiError('ai_invalid_stream');
       let index: number;
       while ((index = buffer.indexOf('\n\n')) !== -1) {
         const chunk = parse(buffer.slice(0, index));
@@ -75,6 +88,12 @@ export async function* streamGemini(history: ChatMessage[], message: string, sig
         break;
       }
     }
+    if (!finished) throw new AiError('ai_network_error');
+    if (!hasText) throw new AiError('ai_empty_response');
+  } catch (error) {
+    if (signal.aborted) throw signal.reason;
+    if (error instanceof AiError) throw error;
+    throw new AiError('ai_network_error');
   } finally {
     await reader.cancel().catch(() => undefined);
     reader.releaseLock();

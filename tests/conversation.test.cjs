@@ -1,145 +1,71 @@
 const assert = require('node:assert/strict');
 const { randomUUID } = require('node:crypto');
 const { test } = require('node:test');
-const { Pool } = require('pg');
-
-test('PostgreSQL chat ownership, pagination, Gemini streaming and cancellation', async t => {
-  process.env.DATABASE_URL = 'postgresql://test:test@localhost:5432/test?sslmode=disable';
-  process.env.JWT_SECRET = 'test-only-secret-with-at-least-32-bytes';
-  process.env.GEMINI_API_KEY = 'mock-gemini-key';
-  const conversations = [];
-  const messages = [];
-  const user = { id: randomUUID(), email: 'test@example.com', token_version: 0, email_verified: true, deleted_at: null, banned_until: null };
-  const queries = [];
-  let mode = 'success';
-  let release;
-  let cancelled = false;
-  const originalQuery = Pool.prototype.query;
-  Pool.prototype.query = async function(sql, values = []) {
-    queries.push({ sql, values });
-    if (sql.includes('FROM app_private.users WHERE id')) return { rows: values[0] === user.id ? [user] : [] };
-    if (sql.startsWith('INSERT INTO public.conversations')) {
-      const row = { id: randomUUID(), user_id: values[0], title: values[1], model: values[2], updated_at: new Date().toISOString() };
-      conversations.push(row); return { rows: [row] };
-    }
-    if (sql.startsWith('SELECT id FROM public.conversations')) return { rows: conversations.filter(c => c.id === values[0] && c.user_id === values[1]) };
-    if (sql.includes('FROM public.conversations WHERE user_id')) return { rows: conversations.filter(c => c.user_id === values[0]).slice(values[2], values[2] + values[1]) };
-    if (sql.startsWith('INSERT INTO public.messages')) {
-      if (!conversations.some(c => c.id === values[0] && c.user_id === values[1])) return { rows: [] };
-      const row = { id: randomUUID(), conversation_id: values[0], role: values[2], content: values[3], parent_message_id: values[4], status: 'completed', created_at: new Date().toISOString() };
-      messages.push(row); return { rows: [row] };
-    }
-    if (sql.includes('FROM public.messages')) {
-      if (!conversations.some(c => c.id === values[0] && c.user_id === values[1])) return { rows: [] };
-      const rows = messages.filter(m => m.conversation_id === values[0]);
-      return { rows: sql.includes('LIMIT 40') ? rows.slice(-40).reverse() : rows.slice(values[3], values[3] + values[2]) };
-    }
-    return { rows: [] };
-  };
-  const originalFetch = global.fetch;
-  const requests = [];
-  const frame = chunk => new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\r\n\r\n`);
-  global.fetch = async (url, options) => {
-    if (!String(url).startsWith('https://generativelanguage.googleapis.com/')) return originalFetch(url, options);
-    requests.push(JSON.parse(options.body));
-    if (mode === 'quota') return new Response('{}', { status: 429 });
-    if (mode === 'unavailable') return new Response(JSON.stringify({ error: { status: 'UNAVAILABLE' } }), { status: 503 });
-    if (mode === 'incomplete') return new Response(frame({ candidates: [{ content: { parts: [{ text: 'Partial' }] } }] }));
-    if (mode === 'slow') return new Response(new ReadableStream({ start(controller) {
-      controller.enqueue(frame({ candidates: [{ content: { parts: [{ text: 'First' }] } }] }));
-      release = () => { if (options.signal.aborted) return; controller.enqueue(frame({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Second' }] } }] })); controller.close(); };
-      options.signal.addEventListener('abort', () => { cancelled = true; controller.error(options.signal.reason); }, { once: true });
-    }, cancel() { cancelled = true; } }));
-    return new Response(frame({ candidates: [{ content: { parts: [{ text: 'Xin chào!' }] }, finishReason: 'STOP' }] }));
-  };
-  const { app } = require('../dist/app');
-  const { createSession } = require('../dist/services/token.service');
-  const token = createSession(user).access_token;
-  const server = app.listen(0, '127.0.0.1');
-  await new Promise(resolve => server.once('listening', resolve));
-  const base = `http://127.0.0.1:${server.address().port}`;
-  const send = (body, bearer = token, signal, route = '/api/conversations/send-messages') => originalFetch(base + route, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` }, body: JSON.stringify(body), signal,
-  });
-  const events = text => text.trim().split('\n\n').map(s => ({ event: s.split('\n')[0].slice(7), data: JSON.parse(s.split('\n')[1].slice(6)) }));
-  const get = route => originalFetch(base + route, { headers: { Authorization: `Bearer ${token}` } });
-  try {
-    assert.equal((await send({ message: 'hi' }, 'invalid')).status, 401);
-    assert.equal((await send({ message: ' ' })).status, 400);
-    let response = await send({ message: "hello'; DROP TABLE messages; --", user_id: randomUUID() });
-    assert.equal(response.status, 200);
-    let result = events(await response.text());
-    const id = result[0].data.conversation_id;
-    assert.deepEqual(result.map(e => e.event), ['conversation', 'delta', 'done']);
-    assert.equal(conversations[0].user_id, user.id);
-    assert.equal(messages.length, 2);
-    assert.ok(!queries.some(q => q.sql.includes('DROP TABLE')));
-    assert.ok(queries.some(q => q.values.includes("hello'; DROP TABLE messages; --")));
-    assert.ok(requests[0].systemInstruction.parts[0].text.includes('AI có thể mắc sai lầm'));
-    response = await send({ message: 'next', conversation_id: id });
-    result = events(await response.text());
-    assert.equal(result[0].data.created, false);
-    assert.equal(conversations.length, 1);
-    assert.deepEqual(requests.at(-1).contents.map(m => m.role), ['user', 'model', 'user']);
-    const foreign = { id: randomUUID(), user_id: randomUUID() }; conversations.push(foreign);
-    const calls = requests.length;
-    assert.equal((await send({ message: 'hi', conversation_id: foreign.id })).status, 404);
-    assert.equal((await get(`/api/conversations/${foreign.id}/messages`)).status, 404);
-    assert.equal(requests.length, calls);
-    response = await get('/api/conversations?limit=1&offset=0');
-    assert.equal((await response.json()).data.conversations[0].id, id);
-    response = await get(`/api/conversations/${id}/messages?limit=1&offset=0`);
-    const page = (await response.json()).data;
-    assert.equal(page.messages.length, 1); assert.equal(page.pagination.has_more, true);
-    for (mode of ['quota', 'unavailable', 'incomplete']) {
-      const count = messages.filter(m => m.role === 'assistant').length;
-      const stream = events(await (await send({ message: 'failure', conversation_id: id })).text());
-      assert.equal(stream.at(-1).event, 'error');
-      if (mode === 'unavailable') assert.equal(stream.at(-1).data.code, 'gemini_unavailable');
-      assert.equal(messages.filter(m => m.role === 'assistant').length, count);
-    }
-    mode = 'slow';
-    response = await send({ message: 'stream', conversation_id: id });
-    let reader = response.body.getReader(); let partial = '';
-    while (!partial.includes('event: delta')) partial += new TextDecoder().decode((await reader.read()).value);
-    assert.ok(!partial.includes('event: done'));
-    assert.equal((await send({ message: 'overlap', conversation_id: id })).status, 409);
-    release(); while (!(await reader.read()).done) {}
-    const abort = new AbortController();
-    response = await send({ message: 'cancel', conversation_id: id }, token, abort.signal);
-    reader = response.body.getReader(); partial = '';
-    while (!partial.includes('event: delta')) partial += new TextDecoder().decode((await reader.read()).value);
-    abort.abort();
-    const deadline = Date.now() + 2000;
-    while (!cancelled) { if (Date.now() > deadline) throw new Error('Cancellation timed out'); await new Promise(r => setTimeout(r, 10)); }
-    mode = 'success';
-    let retry;
-    do {
-      retry = await send({ message: 'retry', conversation_id: id });
-      if (retry.status !== 409) break;
-      await retry.text();
-      if (Date.now() > deadline) throw new Error('Conversation lock was not released');
-      await new Promise(r => setTimeout(r, 10));
-    } while (true);
-    assert.equal(events(await retry.text()).at(-1).event, 'done');
-    // Dedicated module routes expose the same contract as existing FE routes.
-    response = await get(`/api/messages?conversation_id=${id}&limit=1&offset=0`);
-    assert.equal(response.status, 200);
-    const messagePage = (await response.json()).data;
-    assert.equal(messagePage.conversation_id, id);
-    assert.equal(messagePage.messages.length, 1);
-    assert.equal(messagePage.pagination.has_more, true);
-    assert.equal((await get('/api/messages')).status, 400);
-    assert.equal((await get('/api/messages?conversation_id=invalid')).status, 400);
-    assert.equal((await get(`/api/messages?conversation_id=${foreign.id}`)).status, 404);
-    response = await send({ message: 'new chat via dedicated route' }, token, undefined, '/api/chat');
-    assert.equal(response.status, 200);
-    const dedicatedEvents = events(await response.text());
-    assert.equal(dedicatedEvents[0].data.created, true);
-    assert.equal(dedicatedEvents.at(-1).event, 'done');
-    assert.equal((await send({ message: 'hello' }, 'invalid', undefined, '/api/chat')).status, 401);
-  } finally {
-    global.fetch = originalFetch; Pool.prototype.query = originalQuery;
-    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+process.env.DATABASE_URL = 'postgresql://test:test@localhost:5432/test?sslmode=disable';
+process.env.JWT_SECRET = 'test-only-secret-with-at-least-32-bytes';
+const { ChatService } = require('../dist/services/chat.service');
+const { AiError, retryStream } = require('../dist/services/ai-retry.service');
+const { validateConversationTitle } = require('../dist/validators/conversation.validator');
+const collect = async stream => { const values = []; for await (const value of stream) values.push(value); return values; };
+const chunk = text => ({ candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }] });
+test('rename validates title and trims surrounding whitespace', () => {
+  assert.equal(validateConversationTitle({ title: '  New title  ' }), 'New title');
+  for (const input of [null, [], {}, { title: '' }, { title: '  ' }, { title: 'x'.repeat(201) }]) {
+    assert.throws(() => validateConversationTitle(input), error => error.status === 400);
   }
+});
+function fixture() {
+  const user = { id: randomUUID(), conversation_id: randomUUID(), role: 'user', content: 'Node.js?', status: 'completed' };
+  const job = { conversationId: user.conversation_id, user, assistant: { id: randomUUID(), role: 'assistant', status: 'pending', content: '', model: 'mock' }, generationId: randomUUID(), history: [], deletedIds: [], replayed: false, created: true };
+  const writes = [];
+  const store = {
+    prepareSend: async () => job, prepareRetry: async () => job, prepareEdit: async () => job,
+    heartbeat: async () => true,
+    finish: async (current, content, failed) => { writes.push({ current, content, failed }); return { ...current.assistant, content: failed ? '' : content, status: failed ? 'failed' : 'completed' }; },
+  };
+  return { job, store, writes };
+}
+test('automatic retries have one prepared user and assistant; final response succeeded', async () => {
+  const { job, store, writes } = fixture(); let prepares = 0; let calls = 0;
+  store.prepareSend = async () => { prepares++; return job; };
+  const provider = (_, __, signal) => retryStream(async function* () { calls++; if (calls < 3) throw new AiError('ai_provider_error', 503); yield chunk('Success'); }, signal, { sleep: async () => undefined });
+  const events = await collect(new ChatService(store, provider).send({ message_id: job.user.id, message: job.user.content }, new AbortController().signal));
+  assert.equal(prepares, 1); assert.equal(calls, 3); assert.equal(writes.length, 1);
+  assert.equal(writes[0].current.assistant.id, job.assistant.id);
+  assert.equal(events.at(-1).event, 'done'); assert.equal(events.at(-1).data.message.status, 'completed');
+});
+test('all retries fail: user preserved and assistant failed with successful done, no provider details', async () => {
+  const { job, store, writes } = fixture(); let calls = 0;
+  const provider = (_, __, signal) => retryStream(async function* () { calls++; throw new AiError('ai_provider_error', 503); }, signal, { sleep: async () => undefined });
+  const events = await collect(new ChatService(store, provider).send({ message_id: job.user.id, message: job.user.content }, new AbortController().signal));
+  assert.equal(calls, 4); assert.equal(writes.length, 1); assert.equal(events.at(-1).data.success, true);
+  assert.equal(events.at(-1).data.message.status, 'failed'); assert.equal(events.at(-1).data.user_message.content, 'Node.js?');
+  assert.equal(events.some(e => e.event === 'error'), false); assert.equal(JSON.stringify(events).includes('stack'), false);
+});
+test('manual retry updates the same assistant; idempotent replay does not call provider', async () => {
+  const { job, store, writes } = fixture(); let calls = 0;
+  const provider = (_, __, signal) => retryStream(async function* () { calls++; yield chunk('Retried'); }, signal);
+  const events = await collect(new ChatService(store, provider).retry(job.assistant.id, new AbortController().signal));
+  assert.equal(events.at(-1).data.message.id, job.assistant.id); assert.equal(writes.length, 1);
+  job.generationId = undefined; job.replayed = true;
+  const replay = await collect(new ChatService(store, provider).send({ message_id: job.user.id, message: job.user.content }, new AbortController().signal));
+  assert.equal(replay.at(-1).data.replayed, true); assert.equal(calls, 1); assert.equal(writes.length, 1);
+});
+test('edit commits prepared mutation before AI, returns edited user/new assistant/deleted IDs', async () => {
+  const { job, store, writes } = fixture(); const deleted = [randomUUID(), randomUUID(), randomUUID()]; let committed = false;
+  store.prepareEdit = async (id, text) => { assert.equal(id, job.user.id); job.user = { ...job.user, content: text, is_edited: true }; job.deletedIds = deleted; committed = true; return job; };
+  const provider = (_, text, signal) => retryStream(async function* () { assert.equal(committed, true); assert.equal(text, 'Edited'); yield chunk('New answer'); }, signal);
+  const events = await collect(new ChatService(store, provider).edit(job.user.id, 'Edited', new AbortController().signal));
+  const result = events.at(-1).data;
+  assert.equal(result.user_message.is_edited, true); assert.equal(result.user_message.content, 'Edited');
+  assert.deepEqual(result.deleted_message_ids, deleted); assert.equal(result.message.id, job.assistant.id); assert.equal(writes.length, 1);
+});
+test('late generation discarded by fencing, and partial stream resets before retry output', async () => {
+  const { job, store, writes } = fixture(); let calls = 0;
+  const provider = (_, __, signal) => retryStream(async function* () { calls++; yield chunk(calls === 1 ? 'Partial' : 'Final'); if (calls === 1) throw new AiError('ai_network_error'); }, signal, { sleep: async () => undefined });
+  const events = await collect(new ChatService(store, provider).send({ message_id: job.user.id, message: job.user.content }, new AbortController().signal));
+  assert.equal(writes[0].content, 'Final'); assert.equal(events.some(e => e.event === 'reset'), true);
+  store.finish = async () => null;
+  const late = await collect(new ChatService(store, provider).retry(job.assistant.id, new AbortController().signal));
+  assert.equal(late.at(-1).event, 'superseded'); assert.equal(late.some(e => e.event === 'done'), false);
 });

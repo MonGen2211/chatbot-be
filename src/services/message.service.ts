@@ -7,3 +7,4 @@ export async function getMessages(auth: AuthContext, conversationId: string, pag
   await new ConversationRepository(auth.db, auth.userId, signal).findOwned(conversationId);
   return new MessageRepository(auth.db, auth.userId, signal).listMessages(conversationId, pagination);
 }
+
