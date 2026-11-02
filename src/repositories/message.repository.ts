@@ -4,7 +4,7 @@ import type { ChatMessage, MessageMetadata, StoredMessage } from '../types/messa
 import type { PaginationInput } from '../types/pagination.types';
 import { query } from '../config/database';
 
-const messageColumns = 'id, conversation_id, parent_message_id, role, content, status, provider, model, created_at, updated_at';
+const messageColumns = 'id, conversation_id, parent_message_id, role, content, status, provider, model, created_at, updated_at, is_edited, edited_at';
 export class MessageRepository {
   constructor(private readonly db: Pool, private readonly userId: string, private readonly signal: AbortSignal) {}
   private async rows<Row extends Record<string, unknown>>(operation: string, sql: string, values: unknown[]) {
@@ -12,10 +12,14 @@ export class MessageRepository {
   }
 
   async listMessages(id: string, { limit, offset }: PaginationInput) {
+    await this.rows('messages.expireStale', `UPDATE public.messages SET status = 'failed', generation_id = NULL,
+      error_text = 'Câu trả lời bị gián đoạn. Vui lòng thử lại.', updated_at = now()
+      WHERE conversation_id = $1 AND role = 'assistant' AND status = 'pending' AND updated_at <= now() - interval '2 minutes'
+      AND EXISTS (SELECT 1 FROM public.conversations c WHERE c.id = $1 AND c.user_id = $2)`, [id, this.userId]);
     const rows = await this.rows<StoredMessage>('messages.list',
       `SELECT ${messageColumns} FROM public.messages WHERE conversation_id = $1
        AND EXISTS (SELECT 1 FROM public.conversations c WHERE c.id = $1 AND c.user_id = $2)
-       ORDER BY created_at ASC, id ASC LIMIT $3 OFFSET $4`, [id, this.userId, limit + 1, offset]);
+       ORDER BY sequence_no ASC LIMIT $3 OFFSET $4`, [id, this.userId, limit + 1, offset]);
     return { conversation_id: id, messages: rows.slice(0, limit), pagination: { limit, offset, has_more: rows.length > limit } };
   }
 
