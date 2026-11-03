@@ -1,73 +1,261 @@
-# AI Chat Backend
+<div align="center">
 
-Express + TypeScript, truy vấn PostgreSQL trực tiếp bằng `pg`, tự quản lý auth bằng bcrypt + JWT và gọi Gemini streaming. PostgreSQL vẫn có thể host trên Supabase; backend không gọi Supabase Auth/Data API nữa.
+# 🤖 AI Chat Backend
 
-## Cấu hình và chạy
+**Backend trò chuyện AI — gọn gàng để phát triển, rõ ràng để tích hợp.**
 
-Node.js 22 trở lên. Trong `ai-chat-be`, tạo `.env` theo `.env.example` nếu chưa có. Không copy đè `.env` đã điền key.
+Express · TypeScript · PostgreSQL · JWT · Gemini Streaming
 
-- `DATABASE_URL`: PostgreSQL URI từ Supabase → Connect → Session pooler, giống kết nối DBeaver. Điền mật khẩu database thật và URL-encode các ký tự đặc biệt trong mật khẩu. Đây không phải Supabase API key. Ưu tiên Session pooler cổng 5432; transaction pooler 6543 cũng hỗ trợ vì code không dùng prepared statement có tên.
-- `JWT_SECRET`: chuỗi ngẫu nhiên ít nhất 32 byte, giữ riêng trên backend. Đã tạo một secret ngẫu nhiên trong `.env` local nếu trước đó chưa có.
-- `JWT_EXPIRES_IN`: mặc định `1h`, cho phép từ 60 giây tới 7 ngày.
-- `GEMINI_API_KEY`, `GEMINI_MODEL`: key/model Google AI Studio, chỉ dùng ở backend.
-- `CORS_ORIGIN`: địa chỉ FE, mặc định `http://localhost:5173`.
+[![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Express](https://img.shields.io/badge/Express-API-000000?logo=express&logoColor=white)](https://expressjs.com/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-Ready-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pg-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+
+[🚀 Bắt đầu](#-bắt-đầu-trong-5-bước) · [📖 Swagger](#-swagger--thử-api-trực-tiếp) · [🔌 API](#-api-reference) · [🧩 Tài liệu FE](#-tài-liệu-tích-hợp-frontend)
+
+</div>
+
+---
+
+## ✨ Tổng quan
+
+AI Chat Backend cung cấp API để đăng ký/đăng nhập, quản lý hội thoại, lưu lịch sử tin nhắn và nhận phản hồi **Gemini theo thời gian thực qua SSE**.
+
+| Thành phần | Công nghệ / vai trò |
+| --- | --- |
+| API server | Express + TypeScript |
+| Database | PostgreSQL, truy vấn trực tiếp bằng `pg` |
+| Authentication | `bcrypt` + JWT, do backend quản lý |
+| AI | Gemini streaming qua Server-Sent Events (SSE) |
+| API playground | Swagger UI / OpenAPI JSON |
+| Database hosting | Có thể dùng PostgreSQL trên Supabase; **không dùng Supabase Auth/Data API** |
+
+### 🌟 Những gì đã hỗ trợ
+
+- 🔐 Đăng ký, đăng nhập và xác thực Bearer token.
+- 💬 Tạo hội thoại, lấy danh sách hội thoại và lịch sử tin nhắn.
+- ⚡ Stream phản hồi Gemini qua SSE.
+- 🔁 Retry tin nhắn AI thất bại; chỉnh sửa tin nhắn người dùng và tạo phản hồi mới.
+- 📝 Đổi tên, 🗑️ xóa hội thoại cùng toàn bộ tin nhắn.
+- 🛡️ Kiểm tra quyền sở hữu, transaction, idempotency và chống kết quả AI cũ ghi đè.
+
+## 🏗️ Kiến trúc ở mức tổng quan
+
+```mermaid
+flowchart LR
+    FE[Frontend / Postman] -->|HTTP + JWT| API[Express API]
+    API --> AUTH[Auth: bcrypt + JWT]
+    API --> CHAT[Chat Service]
+    CHAT --> DB[(PostgreSQL)]
+    CHAT -->|Streaming request| GEM[Gemini API]
+    GEM -->|SSE| CHAT
+    CHAT -->|SSE| FE
+```
+
+**Phân chia trách nhiệm:** `Conversation` quản lý danh sách/đổi tên/xóa; `Message` đọc/ghi tin nhắn; `Chat` điều phối hội thoại, lịch sử, Gemini và streaming. `ChatRepository` xử lý transaction cho send/retry/edit, idempotency và bảo vệ kết quả theo generation. Khi xóa hội thoại, backend dùng cùng khóa conversation với send/edit/retry và **không giữ transaction trong lúc gọi AI**.
+
+## 🚀 Bắt đầu trong 5 bước
+
+**Yêu cầu:** Node.js **22+**, npm và PostgreSQL có thể kết nối.
+
+### 1. Mở thư mục backend
+
+```powershell
+cd ai-chat-be
+```
+
+### 2. Chuẩn bị môi trường
+
+Tạo `.env` từ `.env.example` **chỉ khi chưa có**. Không ghi đè `.env` đã chứa secret.
+
+| Biến | Mục đích |
+| --- | --- |
+| `DATABASE_URL` | URI PostgreSQL từ Supabase → **Connect → Session pooler** |
+| `DATABASE_CA_FILE` | Đường dẫn chứng chỉ CA nếu kết nối TLS cần |
+| `JWT_SECRET` | Secret ngẫu nhiên **ít nhất 32 byte**, chỉ lưu trên backend |
+| `JWT_EXPIRES_IN` | Mặc định `1h`; hỗ trợ từ 60 giây đến 7 ngày |
+| `GEMINI_API_KEY` | API key Google AI Studio |
+| `GEMINI_MODEL` | Model Gemini được sử dụng |
+| `CORS_ORIGIN` | URL frontend; mặc định `http://localhost:5173` |
+
+> [!IMPORTANT]
+> `DATABASE_URL` là **PostgreSQL connection URI**, không phải Supabase API key. Điền mật khẩu database thật và URL-encode ký tự đặc biệt. Ưu tiên **Session pooler cổng 5432**; transaction pooler cổng 6543 cũng được hỗ trợ vì code không dùng named prepared statements.
+
+> [!NOTE]
+> Kết nối PostgreSQL sử dụng TLS và kiểm tra chứng chỉ. Nếu gặp lỗi CA, tải certificate từ Supabase và thiết lập `DATABASE_CA_FILE`; **không tắt certificate verification**. Không cần Supabase URL/publishable/secret API key ở runtime; biến cũ có thể giữ tạm trong `.env` nhưng code không sử dụng.
+
+### 3. Cài dependencies
 
 ```powershell
 npm.cmd install
+```
+
+### 4. Kiểm tra và chuẩn bị database
+
+```powershell
 npm.cmd run db:check
 npm.cmd run db:migrate
 npm.cmd run db:types
+```
+
+| Lệnh | Tác dụng |
+| --- | --- |
+| `db:check` | Kiểm tra kết nối và bảng, **không ghi dữ liệu** |
+| `db:migrate` | Áp dụng migration, thay đổi schema và chuyển tài khoản cũ |
+| `db:types` | Sinh `src/types/database.types.ts` từ metadata PostgreSQL |
+
+> [!WARNING]
+> **Backup/kiểm tra dữ liệu trước khi migrate** trên môi trường quan trọng. Migration có thể thay đổi schema và dữ liệu. Phải migrate trước khi gọi API.
+
+### 5. Khởi động server
+
+```powershell
 npm.cmd run dev
 ```
 
-`db:check` chỉ kiểm tra kết nối và bảng, không ghi dữ liệu. `db:migrate` thay đổi schema/copy tài khoản theo migration đã chuẩn bị. Chạy migration trước khi gọi API. API mặc định ở `http://localhost:3001`.
+Backend mặc định: **http://localhost:3001** 🎉
 
-Kết nối database dùng TLS có kiểm tra chứng chỉ. Nếu gặp lỗi CA, tải certificate database trong Supabase và cấu hình `DATABASE_CA_FILE`; không tắt kiểm tra chứng chỉ. Pool giới hạn 5 kết nối, query có timeout và shutdown đóng pool. Không cần Supabase URL/publishable/secret API key ở runtime; các biến cũ trong `.env` có thể giữ tạm nhưng không được code dùng.
+## 📖 Swagger — thử API trực tiếp
 
-## Chuyển tài khoản Supabase Auth cũ
+| Giao diện | Địa chỉ |
+| --- | --- |
+| Swagger UI | [http://localhost:3001/api-docs](http://localhost:3001/api-docs) |
+| OpenAPI JSON | [http://localhost:3001/api-docs.json](http://localhost:3001/api-docs.json) |
 
-Migration `migrations/001_local_auth.sql` chạy trong transaction, có bảng theo dõi và checksum để không chạy lặp:
+**Luồng thử nhanh:**
 
-- Tạo `app_private.users` để lưu email, password hash, trạng thái tài khoản và token version. Schema này không được public qua Supabase Data API.
-- Copy user cũ từ `auth.users`, giữ nguyên UUID, hash bcrypt, trạng thái xác nhận email, khóa/xóa tài khoản.
-- Đổi khóa ngoại `profiles.id` sang `app_private.users.id`. Bảng profiles, conversations và messages cùng dữ liệu chat hiện có được giữ lại. Không xóa schema `auth` hay user cũ.
-- Người dùng email/password cũ đã xác nhận email có thể đăng nhập lại bằng mật khẩu cũ. Token Supabase cũ không còn được backend chấp nhận.
-- User chưa xác nhận email trước khi chuyển vẫn bị chặn; không tự bỏ trạng thái này. Tài khoản social/passwordless vẫn được giữ ID nhưng không thể đăng nhập bằng mật khẩu khi chưa có password hash. Chưa có API xác nhận email/đặt lại mật khẩu cho các trường hợp này.
-- Tài khoản đăng ký mới được tạo trong `app_private.users` cùng profile bằng một transaction; không ghi vào `auth.users`, không gửi email xác nhận và trả session ngay.
+1. Gọi `POST /api/auth/register` hoặc `POST /api/auth/login`.
+2. Copy `data.session.access_token` từ response.
+3. Trong Swagger, nhấn **Authorize** và nhập access token theo hướng dẫn của giao diện.
+4. Thử các endpoint conversation, message và chat có yêu cầu xác thực.
 
-Kiểm tra/backup database trước khi áp dụng migration lên môi trường có dữ liệu quan trọng. Nếu gặp email trùng khi chuẩn hóa chữ thường hoặc dữ liệu liên kết không hợp lệ, migration rollback thay vì bỏ qua/mất dữ liệu. Chỉ backend có DB credentials truy cập schema riêng. Không tiếp tục đăng ký qua Supabase Auth sau khi chuyển sang auth của backend.
+Header khi gọi API từ FE/Postman:
 
-## APIs cho FE/Postman
+```http
+Authorization: Bearer <access_token>
+```
 
-- `POST /api/auth/register`: `{ "email": "new@example.com", "password": "StrongPassword123!" }`, trả 201.
-- `POST /api/auth/login`: `{ "email": "new@example.com", "password": "StrongPassword123!" }`, trả 200.
-- `GET /api/conversations?limit=50&offset=0`: conversation của user đăng nhập.
-- `GET /api/messages?conversation_id=UUID&limit=50&offset=0`: lịch sử của conversation thuộc user đó.
-- `POST /api/chat`: gửi message và nhận Gemini SSE. Body `{ "message_id": "UUID do FE tạo", "message": "...", "conversation_id": "UUID nếu chat tiếp" }`.
-- `POST /api/chat/messages/:assistant_message_id/retry`: thử lại assistant failed trên cùng record.
-- `PATCH /api/chat/messages/:user_message_id`: sửa user message, body `{ "message": "..." }`, xóa phần phía sau và tạo assistant mới.
-- `PATCH /api/conversations/:conversation_id`: đổi tên, body `{ "title": "..." }`.
-- `DELETE /api/conversations/:conversation_id`: xóa conversation và toàn bộ messages.
+## 🔌 API Reference
 
-Hai URL cũ `GET /api/conversations/:conversation_id/messages` và `POST /api/conversations/send-messages` vẫn hoạt động, dùng cùng handler. FE phải gửi thêm message_id UUID và xử lý status/reset theo hợp đồng mới.
+### 🔐 Authentication
 
-Code chia ba phần: Conversation quản lý danh sách/đổi tên/xóa; Message đọc/ghi messages; Chat điều phối tạo/dùng lại conversation, lịch sử, Gemini và streaming. ChatRepository xử lý transaction cho send/retry/edit, idempotency và chống kết quả cũ ghi đè. Migration 002 thêm sequence_no, generation_id, is_edited/edited_at và bảng idempotency riêng. Xóa conversation dùng cùng khóa conversation để không xung đột với send/edit/retry; không giữ transaction khi gọi AI. Không có API xóa message riêng; edit vẫn xóa các tin phía sau và xóa conversation vẫn xóa toàn bộ messages.
+| Method | Endpoint | Chức năng |
+| --- | --- | --- |
+| `POST` | `/api/auth/register` | Tạo tài khoản — `201` |
+| `POST` | `/api/auth/login` | Đăng nhập — `200` |
 
-Auth trả `data.user` và `data.session.access_token`, `token_type`, `expires_in`, `expires_at`. FE tiếp tục dùng `Authorization: Bearer <access_token>` cho chat/history. Không có refresh token; hết hạn thì đăng nhập lại. Chưa triển khai logout server, refresh, quên mật khẩu hoặc xác nhận email. Đăng ký mật khẩu tối thiểu 8 ký tự, tối đa 72 byte UTF-8 vì bcrypt. Login dùng email không phân biệt chữ hoa/thường và mật khẩu giữ nguyên khoảng trắng.
+Body mẫu:
 
-Đăng nhập/đăng ký giới hạn chung 30 request/15 phút/IP trong mỗi process. Chưa cấu hình trust proxy; khi triển khai sau reverse proxy cần thiết lập đúng địa chỉ proxy tin cậy và cân nhắc store rate-limit dùng chung nếu có nhiều instance.
+```json
+{
+  "email": "new@example.com",
+  "password": "StrongPassword123!"
+}
+```
 
-Backend lấy ID chủ sở hữu từ JWT đã xác minh và kiểm tra tài khoản còn hoạt động. Không lấy `user_id` từ body/query. Mọi truy vấn chat có điều kiện user ID; không có phân vai admin/user. Database vẫn kiểm tra quyền kết nối, khóa ngoại và constraints. Backend không tự tắt/bật RLS trên các bảng chat.
+Auth response trả `data.user` và `data.session` gồm `access_token`, `token_type`, `expires_in`, `expires_at`.
 
-Chi tiết: [send-messages.md](docs/send-messages.md). Retry/edit và hợp đồng SSE mới: [chat-operations.md](docs/chat-operations.md).
+### 💬 Conversations & Messages
 
-Mô tả để gửi cho FE: [frontend-api.md](docs/frontend-api.md).
+| Method | Endpoint | Chức năng |
+| --- | --- | --- |
+| `GET` | `/api/conversations?limit=50&offset=0` | Danh sách hội thoại của người đăng nhập |
+| `GET` | `/api/messages?conversation_id=UUID&limit=50&offset=0` | Lịch sử tin nhắn thuộc hội thoại |
+| `PATCH` | `/api/conversations/:conversation_id` | Đổi tên hội thoại |
+| `DELETE` | `/api/conversations/:conversation_id` | Xóa hội thoại và toàn bộ tin nhắn |
 
-Mô tả riêng 4 API retry/edit/rename/delete conversation cho FE: [fe-message-actions.md](docs/fe-message-actions.md).
+Body đổi tên:
 
-## Types và kiểm tra
+```json
+{ "title": "Cuộc hội thoại mới" }
+```
 
-`npm.cmd run db:types` đọc metadata `information_schema`/PostgreSQL để sinh types cho các bảng public vào `src/types/database.types.ts`. Không đọc nội dung tài khoản/tin nhắn, không cần Supabase CLI/API key. Generator hỗ trợ columns, nullability, defaults, enum values và kiểu dữ liệu đang dùng; chưa sinh join Relationships, views hoặc RPC. `chat.types.ts` giữ DTO request/response/streaming dựa trên types public. Các query `pg` dùng generic Row type và tham số `$1`, `$2`; schema types không tự kiểm tra cú pháp SQL lúc compile.
+### ⚡ Chat, Retry & Edit
+
+| Method | Endpoint | Chức năng |
+| --- | --- | --- |
+| `POST` | `/api/chat` | Gửi tin nhắn, nhận Gemini SSE |
+| `POST` | `/api/chat/messages/:assistant_message_id/retry` | Retry assistant message thất bại trên cùng record |
+| `PATCH` | `/api/chat/messages/:user_message_id` | Sửa tin nhắn user, xóa phần sau và tạo assistant mới |
+
+Body gửi chat:
+
+```json
+{
+  "message_id": "UUID-do-frontend-tao",
+  "message": "Xin chào!",
+  "conversation_id": "UUID-neu-tiep-tuc-hoi-thoai"
+}
+```
+
+`conversation_id` dùng khi chat tiếp; `message_id` là UUID do FE tạo. Body sửa tin nhắn:
+
+```json
+{ "message": "Nội dung đã chỉnh sửa" }
+```
+
+**Tương thích ngược:** Hai endpoint cũ vẫn hoạt động và dùng cùng handler:
+
+- `GET /api/conversations/:conversation_id/messages`
+- `POST /api/conversations/send-messages`
+
+> [!IMPORTANT]
+> Frontend cần gửi `message_id` UUID và xử lý **status/reset** theo hợp đồng SSE mới. Xem [chat-operations.md](docs/chat-operations.md) và [send-messages.md](docs/send-messages.md) trước khi tích hợp.
+
+## 🗃️ Database & chuyển đổi Supabase Auth
+
+Backend truy vấn PostgreSQL trực tiếp bằng `pg`. Database vẫn có thể được host tại Supabase, nhưng **authentication và truy vấn dữ liệu không đi qua Supabase Auth/Data API**.
+
+### Migration 001 — Local authentication
+
+File: `migrations/001_local_auth.sql`
+
+- Tạo `app_private.users` chứa email, bcrypt password hash, trạng thái tài khoản và token version; schema này không được public qua Supabase Data API.
+- Copy tài khoản từ `auth.users`, giữ nguyên UUID, password hash bcrypt, trạng thái email xác nhận và trạng thái khóa/xóa.
+- Chuyển khóa ngoại `profiles.id` sang `app_private.users.id`; giữ dữ liệu profiles, conversations và messages.
+- Giữ nguyên `auth` schema và user cũ; backend **không chấp nhận token Supabase cũ**.
+- Migration chạy trong transaction, có theo dõi checksum để tránh chạy lặp; dữ liệu email trùng sau chuẩn hóa hoặc quan hệ không hợp lệ sẽ làm rollback.
+
+**Hành vi tài khoản sau chuyển đổi:**
+
+| Trường hợp | Kết quả |
+| --- | --- |
+| Email/password cũ, đã xác nhận email | Đăng nhập lại bằng mật khẩu cũ |
+| Chưa xác nhận email | Tiếp tục bị chặn |
+| Social/passwordless, không có password hash | Giữ ID, chưa thể đăng nhập bằng password |
+| Đăng ký mới | Tạo `app_private.users` + profile trong một transaction, cấp session ngay, không gửi email xác nhận |
+
+> [!CAUTION]
+> Không tiếp tục đăng ký qua Supabase Auth sau khi chuyển. Hiện chưa có API xác nhận email hoặc đặt lại mật khẩu cho tài khoản cần các bước này.
+
+### Migration 002 — Chat operations
+
+Bổ sung `sequence_no`, `generation_id`, `is_edited`, `edited_at` và bảng idempotency riêng để hỗ trợ send/retry/edit an toàn.
+
+### Database types
+
+`db:types` đọc metadata từ `information_schema`/PostgreSQL, **không đọc nội dung tài khoản hay tin nhắn** và không cần Supabase CLI/API key. Generator hỗ trợ columns, nullability, defaults, enum values và các kiểu dữ liệu hiện dùng; **chưa** sinh Relationships, views hoặc RPC.
+
+`chat.types.ts` định nghĩa DTO request/response/streaming dựa trên public schema types. Query `pg` dùng generic Row type và placeholder `$1`, `$2`; type generator **không kiểm tra cú pháp SQL tại compile time**.
+
+## 🛡️ Bảo mật & giới hạn hiện tại
+
+| Hạng mục | Thiết kế hiện tại |
+| --- | --- |
+| Xác thực | JWT được verify; backend kiểm tra tài khoản còn hoạt động |
+| Phân quyền dữ liệu | Owner ID lấy từ JWT, không tin `user_id` trong body/query; truy vấn chat lọc theo user ID |
+| Password | Đăng ký từ 8 ký tự đến tối đa 72 byte UTF-8 (bcrypt) |
+| Email | Login không phân biệt hoa/thường; password giữ nguyên khoảng trắng |
+| Token | Access token có hạn; **không có refresh token**, hết hạn phải đăng nhập lại |
+| Rate limit | Login/register dùng chung 30 request / 15 phút / IP / process |
+| Database | Credentials chỉ ở backend; DB kiểm tra quyền kết nối, FK và constraints; backend không tự bật/tắt RLS của bảng chat |
+| Pool | Tối đa 5 kết nối, có query timeout và đóng pool khi shutdown |
+
+**Chưa triển khai:** logout server-side, refresh token, quên mật khẩu, xác nhận email, phân vai admin/user, API xóa riêng từng message.
+
+**Khi deploy:** cần cấu hình `trust proxy` đúng với reverse proxy tin cậy và cân nhắc rate-limit store dùng chung nếu chạy nhiều instance.
+
+## 🧪 Build & Test
 
 ```powershell
 npm.cmd run build
@@ -75,6 +263,32 @@ npm.cmd test
 npm.cmd start
 ```
 
-Các file test hiện có đã chuyển sang giả lập PostgreSQL và Gemini, không ghi vào database thật và không gọi Google. Kiểm tra thật cần `DATABASE_URL` hợp lệ và migration đã chạy. `npm start` dùng bản build trong `dist/`.
+- `build`: biên dịch ứng dụng.
+- `test`: chạy test giả lập PostgreSQL/Gemini, **không ghi database thật và không gọi Google**.
+- `start`: chạy bản build từ `dist/`.
 
-Tài liệu: [node-postgres queries](https://node-postgres.com/features/queries), [Supabase PostgreSQL connections](https://supabase.com/docs/guides/database/connecting-to-postgres).
+Kiểm tra tích hợp thật cần `DATABASE_URL` hợp lệ và migration đã chạy.
+
+## 🧩 Tài liệu tích hợp Frontend
+
+| Tài liệu | Dành cho |
+| --- | --- |
+| [frontend-api.md](docs/frontend-api.md) | FE tích hợp toàn bộ API |
+| [fe-message-actions.md](docs/fe-message-actions.md) | FE tích hợp retry/edit/rename/delete |
+| [send-messages.md](docs/send-messages.md) | Luồng gửi tin nhắn |
+| [chat-operations.md](docs/chat-operations.md) | Retry/edit và hợp đồng SSE mới |
+
+## 📚 Tham khảo
+
+- [node-postgres — Queries](https://node-postgres.com/features/queries)
+- [Supabase — Connect to Postgres](https://supabase.com/docs/guides/database/connecting-to-postgres)
+
+---
+
+<div align="center">
+
+**Build conversations. Stream intelligence. 🚀**
+
+<sub>AI Chat Backend · Express + TypeScript + PostgreSQL + Gemini</sub>
+
+</div>
